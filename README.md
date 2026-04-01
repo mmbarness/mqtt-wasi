@@ -103,9 +103,16 @@ if let Some(trace) = TraceContext::from_properties(&msg.properties) {
 ## Building for WASI
 
 ```bash
-cargo build --target wasm32-wasip2 --release              # ~120 KB
-cargo build --target wasm32-wasip2 --release --features tls  # ~950 KB
+cargo build --target wasm32-wasip2 --release
 ```
+
+Binary sizes (wasm32-wasip2, with serde_json, LTO, `opt-level = "z"`, `panic = "abort"`):
+
+| Example | Size |
+|---------|------|
+| `pubsub` (sync client) | ~220 KB |
+| `request_reply` (async client + tokio) | ~270 KB |
+| `tls_pubsub` (sync client + TLS) | ~1.1 MB |
 
 Run with wasmtime:
 
