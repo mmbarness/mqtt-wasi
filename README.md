@@ -6,7 +6,7 @@ Minimal MQTT v5.0 client for Rust that compiles to `wasm32-wasip2`. No host depe
 
 ## Why
 
-No existing Rust MQTT client compiles cleanly to WebAssembly. rumqttc and paho-mqtt pull in tokio's multi-threaded runtime or native TLS — neither works in Wasm. This crate implements the MQTT wire protocol from scratch against `std::net::TcpStream`, which WASI maps automatically via `wasi:sockets/tcp`.
+No existing Rust MQTT client compiles cleanly to WebAssembly. rumqttc and paho-mqtt pull in tokio's multi-threaded runtime or native TLS, but neither work in Wasm. This crate implements the MQTT wire protocol from scratch against `std::net::TcpStream`, which WASI maps automatically via `wasi:sockets/tcp`.
 
 The same binary runs native and on wasmtime.
 
@@ -83,7 +83,7 @@ let client = AsyncMqttClient::connect_with(tls, opts).await.unwrap();
 
 ### Trace Context
 
-W3C Trace Context propagation via MQTT v5 User Properties — no OpenTelemetry SDK required.
+W3C Trace Context propagation via MQTT v5 User Properties. No OpenTelemetry SDK required.
 
 ```rust
 use mqtt_wasi::TraceContext;
@@ -113,12 +113,12 @@ wasmtime run -S inherit-network,allow-ip-name-lookup your_app.wasm
 
 ## Design
 
-- **Protocol layer** (`codec/`) is `no_std` compatible (alloc only) — no `bytes` crate, no derive macros, no `hashbrown`. Encodes to `Vec<u8>`, decodes from `&[u8]` via a lightweight `Cursor`.
-- **Sync client** (`client.rs`) — blocking `TcpStream` with read timeouts for keep-alive.
-- **Async client** (`async_client.rs`) — cooperative non-blocking I/O over one socket. Each `request()` Future pumps the shared socket when polled, dispatching packets by correlation ID. Uses `Rc<RefCell<...>>` (single-threaded, `!Send`). Works with `tokio::join!` but not `tokio::spawn` (use `spawn_local`).
-- **Frame reader** (`frame.rs`) — incremental MQTT frame parser for partial non-blocking reads.
-- **TLS** (`tls.rs`, feature-gated) — `TlsTransport` wraps rustls `StreamOwned` and implements `Transport`. Uses [`rustls-rustcrypto`](https://github.com/RustCrypto/rustls-rustcrypto) (pure Rust, no C dependencies) so TLS compiles to Wasm. The underlying RustCrypto crates are mature; the rustls glue layer is alpha but covers all standard TLS 1.2/1.3 cipher suites.
-- **Properties** stored as `Vec<(PropertyId, PropertyValue)>` — linear scan beats hashing for the typical 0-5 items per packet. Unknown property IDs are skipped rather than erroring.
+- **Protocol layer** (`codec/`) is `no_std` compatible (alloc only). No `bytes` crate, no derive macros, no `hashbrown`. Encodes to `Vec<u8>`, decodes from `&[u8]` via a lightweight `Cursor`.
+- **Sync client** (`client.rs`). Blocking `TcpStream` with read timeouts for keep-alive.
+- **Async client** (`async_client.rs`). Cooperative non-blocking I/O over one socket. Each `request()` Future pumps the shared socket when polled, dispatching packets by correlation ID. Uses `Rc<RefCell<...>>` (single-threaded, `!Send`). Works with `tokio::join!` but not `tokio::spawn` (use `spawn_local`).
+- **Frame reader** (`frame.rs`). Incremental MQTT frame parser for partial non-blocking reads.
+- **TLS** (`tls.rs`, feature-gated). `TlsTransport` wraps rustls `StreamOwned` and implements `Transport`. Uses [`rustls-rustcrypto`](https://github.com/RustCrypto/rustls-rustcrypto) (pure Rust, no C dependencies) so TLS compiles to Wasm. The underlying RustCrypto crates are mature; the rustls glue layer is alpha but covers all standard TLS 1.2/1.3 cipher suites.
+- **Properties** stored as `Vec<(PropertyId, PropertyValue)>`. linear scan beats hashing for the typical 0-5 items per packet. Unknown property IDs are skipped rather than erroring.
 - **Trace context** is pure string formatting per W3C Trace Context Level 1.
 
 ### Features

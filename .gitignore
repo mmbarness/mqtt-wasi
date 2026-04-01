@@ -1,2 +1,4 @@
 /target
 .env
+examples/*/target/
+examples/*/Cargo.lock
