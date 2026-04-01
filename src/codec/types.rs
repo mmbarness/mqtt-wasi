@@ -10,6 +10,9 @@ pub enum PacketType {
     ConnAck = 2,
     Publish = 3,
     PubAck = 4,
+    PubRec = 5,
+    PubRel = 6,
+    PubComp = 7,
     Subscribe = 8,
     SubAck = 9,
     Unsubscribe = 10,
@@ -17,6 +20,7 @@ pub enum PacketType {
     PingReq = 12,
     PingResp = 13,
     Disconnect = 14,
+    Auth = 15,
 }
 
 impl PacketType {
@@ -26,6 +30,9 @@ impl PacketType {
             2 => Ok(PacketType::ConnAck),
             3 => Ok(PacketType::Publish),
             4 => Ok(PacketType::PubAck),
+            5 => Ok(PacketType::PubRec),
+            6 => Ok(PacketType::PubRel),
+            7 => Ok(PacketType::PubComp),
             8 => Ok(PacketType::Subscribe),
             9 => Ok(PacketType::SubAck),
             10 => Ok(PacketType::Unsubscribe),
@@ -33,6 +40,7 @@ impl PacketType {
             12 => Ok(PacketType::PingReq),
             13 => Ok(PacketType::PingResp),
             14 => Ok(PacketType::Disconnect),
+            15 => Ok(PacketType::Auth),
             _ => Err(crate::error::Error::InvalidPacketType(val)),
         }
     }

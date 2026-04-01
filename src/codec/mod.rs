@@ -22,7 +22,16 @@ impl Packet {
             PacketType::PingResp => Ok(Packet::PingResp),
             PacketType::Disconnect => Ok(Packet::Disconnect(DisconnectPacket::decode(body)?)),
             PacketType::PingReq => Ok(Packet::PingReq),
-            // These are client-to-server only; we shouldn't receive them
+            // QoS 2 packets — not implemented but must be recognized to avoid
+            // crashing the connection if a broker sends them.
+            PacketType::PubRec | PacketType::PubRel | PacketType::PubComp => {
+                Err(Error::UnexpectedPacket("QoS 2 not supported"))
+            }
+            // Enhanced authentication — not implemented.
+            PacketType::Auth => {
+                Err(Error::UnexpectedPacket("AUTH not supported"))
+            }
+            // Client-to-server only; we shouldn't receive them.
             PacketType::Connect | PacketType::Subscribe | PacketType::Unsubscribe => {
                 Err(Error::UnexpectedPacket("server-only packet type"))
             }

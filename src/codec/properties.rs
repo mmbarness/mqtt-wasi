@@ -258,10 +258,10 @@ fn skip_property_value(cur: &mut Cursor<'_>, id: u8) -> Result<()> {
         | 0x1F // ReasonString
         => { cur.read_string()?; }
 
-        // Binary data properties
+        // Binary data properties (same length-prefix as strings but may contain non-UTF-8)
         | 0x09 // CorrelationData
         | 0x16 // AuthenticationData
-        => { cur.read_string()?; } // binary data uses same length-prefix as strings
+        => { cur.read_binary()?; }
 
         // UTF-8 string pair
         | 0x26 // UserProperty
