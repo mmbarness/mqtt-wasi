@@ -9,7 +9,7 @@ pub struct ConnectOptions {
     pub username: Option<String>,
     pub password: Option<Vec<u8>>,
     /// When true, the `replyTo` field in request envelopes uses dots instead
-    /// of slashes (e.g. `egress.reply.{id}` instead of `egress/reply/{id}`).
+    /// of slashes (e.g. `replies.{id}` instead of `replies/{id}`).
     ///
     /// Enable this when the reply publisher is an AMQP consumer (e.g. behind
     /// RabbitMQ's MQTT plugin), since AMQP routing keys use dots while MQTT
@@ -31,6 +31,7 @@ impl Default for ConnectOptions {
 }
 
 impl ConnectOptions {
+    /// Create options with the given client ID. Empty string lets the broker assign one.
     pub fn new(client_id: impl Into<String>) -> Self {
         Self {
             client_id: client_id.into(),
@@ -38,11 +39,13 @@ impl ConnectOptions {
         }
     }
 
+    /// Set the keep-alive interval in seconds (default: 60).
     pub fn with_keep_alive(mut self, secs: u16) -> Self {
         self.keep_alive_secs = secs;
         self
     }
 
+    /// Set username and password for broker authentication.
     pub fn with_credentials(mut self, user: impl Into<String>, pass: impl Into<Vec<u8>>) -> Self {
         self.username = Some(user.into());
         self.password = Some(pass.into());

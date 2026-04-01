@@ -2,6 +2,7 @@
 use alloc::string::String;
 use core::fmt;
 
+/// Errors returned by mqtt-wasi operations.
 #[derive(Debug)]
 pub enum Error {
     MalformedPacket(&'static str),

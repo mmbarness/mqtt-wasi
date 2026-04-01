@@ -1,3 +1,14 @@
+//! Minimal MQTT v5.0 client that compiles to `wasm32-wasip2`.
+//!
+//! Two client modes:
+//! - [`MqttClient`] — synchronous, blocking pub/sub
+//! - [`AsyncMqttClient`] — cooperative non-blocking request/reply for concurrent
+//!   calls via `tokio::join!`
+//!
+//! Optional TLS via the `tls` feature (pure Rust crypto, Wasm-compatible).
+//!
+//! See the [README](https://github.com/mmbarness/mqtt-wasi) for full usage examples.
+
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]

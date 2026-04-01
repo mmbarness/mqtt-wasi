@@ -5,6 +5,11 @@ edition = "2021"
 rust-version = "1.94"
 description = "Minimal MQTT v5.0 client that compiles to wasm32-wasip2"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/mmbarness/mqtt-wasi"
+documentation = "https://docs.rs/mqtt-wasi"
+readme = "README.md"
+keywords = ["mqtt", "wasm", "wasip2", "wasmtime", "iot"]
+categories = ["network-programming", "wasm"]
 
 [features]
 default = ["std"]

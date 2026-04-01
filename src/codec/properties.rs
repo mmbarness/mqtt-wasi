@@ -37,6 +37,7 @@ impl PropertyId {
     }
 }
 
+/// A typed MQTT v5 property value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PropertyValue {
     Byte(u8),

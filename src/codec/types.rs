@@ -3,6 +3,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::codec::properties::Properties;
 
+/// MQTT v5 control packet type (4-bit value in the fixed header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PacketType {
@@ -46,6 +47,7 @@ impl PacketType {
     }
 }
 
+/// MQTT Quality of Service level. Only QoS 0 and 1 are supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum QoS {
@@ -63,6 +65,7 @@ impl QoS {
     }
 }
 
+/// Decoded MQTT fixed header (first 2-5 bytes of every packet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedHeader {
     pub packet_type: PacketType,
@@ -136,6 +139,7 @@ pub struct DisconnectPacket {
     pub reason_code: u8,
 }
 
+/// A decoded MQTT v5 control packet.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
     Connect(ConnectPacket),

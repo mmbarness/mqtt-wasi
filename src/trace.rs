@@ -1,7 +1,7 @@
 //! W3C Trace Context propagation via MQTT v5 User Properties.
 //!
 //! Format: `00-{trace_id}-{span_id}-{flags}`
-//! See: https://www.w3.org/TR/trace-context/
+//! See: <https://www.w3.org/TR/trace-context/>
 
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
