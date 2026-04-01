@@ -1,0 +1,33 @@
+[package]
+name = "mqtt-wasi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Minimal MQTT v5.0 client that compiles to wasm32-wasip2"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["std"]
+std = []
+tls = ["std", "dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots", "dep:rustls-rustcrypto"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+uuid = { version = "1", features = ["v4"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["logging", "std", "tls12"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+dotenvy = "0.15.7"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "z"
