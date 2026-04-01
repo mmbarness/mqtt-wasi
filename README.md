@@ -63,7 +63,9 @@ Each `request()` subscribes to a reply topic with a correlation ID, publishes th
 
 ### TLS
 
-Feature-gated behind `tls`. Uses rustls with Mozilla root certificates.
+Optional, feature-gated behind `tls`. The default is plaintext TCP on port 1883 — typical for VPC deployments where the broker terminates TLS at the edge. Enable `tls` when connecting directly to a broker over the public internet (port 8883).
+
+Uses [rustls](https://github.com/rustls/rustls) with [rustls-rustcrypto](https://github.com/RustCrypto/rustls-rustcrypto) (pure Rust crypto, no C dependencies) so TLS compiles to `wasm32-wasip2`. Mozilla root certificates included via [webpki-roots](https://github.com/rustls/webpki-roots).
 
 ```toml
 [dependencies]
