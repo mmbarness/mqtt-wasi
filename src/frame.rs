@@ -83,11 +83,17 @@ impl FrameReader {
     }
 }
 
+impl Default for FrameReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::types::*;
     use crate::codec::properties::Properties;
+    use crate::codec::types::*;
 
     #[test]
     fn complete_packet_in_one_push() {

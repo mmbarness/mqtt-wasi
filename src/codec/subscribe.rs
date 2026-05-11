@@ -59,7 +59,12 @@ impl UnsubscribePacket {
 
         // UNSUBSCRIBE flags must be 0x02 per spec
         let mut packet = Vec::new();
-        encode_fixed_header(&mut packet, PacketType::Unsubscribe, 0x02, body.len() as u32)?;
+        encode_fixed_header(
+            &mut packet,
+            PacketType::Unsubscribe,
+            0x02,
+            body.len() as u32,
+        )?;
         packet.extend_from_slice(&body);
         Ok(packet)
     }

@@ -76,8 +76,13 @@ fn spawn_echo_consumer(
         let msg = client.recv_raw().expect("consumer recv").expect("no msg");
         let req: serde_json::Value = serde_json::from_slice(&msg.payload).expect("parse request");
 
-        let reply_to = req["replyTo"].as_str().expect("missing replyTo").to_string();
-        let correlation_id = req["correlationId"].as_str().expect("missing correlationId");
+        let reply_to = req["replyTo"]
+            .as_str()
+            .expect("missing replyTo")
+            .to_string();
+        let correlation_id = req["correlationId"]
+            .as_str()
+            .expect("missing correlationId");
         let params = req["params"].clone();
 
         let reply = serde_json::json!({
@@ -148,14 +153,11 @@ fn test_request_reply_echo() {
     let topic = format!("test/mqtt-wasi/echo-{id}");
 
     // Consumer: echoes params back as data
-    let consumer = match spawn_echo_consumer(
-        &format!("mw-echo-consumer-{id}"),
-        &topic,
-        |params| params,
-    ) {
-        Some(h) => h,
-        None => return skip(),
-    };
+    let consumer =
+        match spawn_echo_consumer(&format!("mw-echo-consumer-{id}"), &topic, |params| params) {
+            Some(h) => h,
+            None => return skip(),
+        };
 
     thread::sleep(Duration::from_millis(200));
 
@@ -175,7 +177,13 @@ fn test_request_reply_echo() {
     });
     let request_bytes = serde_json::to_vec(&request).expect("serialize");
     client
-        .publish_raw(&topic, &request_bytes, mqtt_wasi::QoS::AtMostOnce, false, Default::default())
+        .publish_raw(
+            &topic,
+            &request_bytes,
+            mqtt_wasi::QoS::AtMostOnce,
+            false,
+            Default::default(),
+        )
         .expect("publish request");
 
     let msg = client.recv_raw().expect("recv reply").expect("no reply");
@@ -196,17 +204,14 @@ fn test_request_reply_transform() {
     let topic = format!("test/mqtt-wasi/transform-{id}");
 
     // Consumer: doubles the "value" field
-    let consumer = match spawn_echo_consumer(
-        &format!("mw-transform-consumer-{id}"),
-        &topic,
-        |params| {
+    let consumer =
+        match spawn_echo_consumer(&format!("mw-transform-consumer-{id}"), &topic, |params| {
             let v = params["value"].as_i64().unwrap_or(0);
             serde_json::json!({"doubled": v * 2})
-        },
-    ) {
-        Some(h) => h,
-        None => return skip(),
-    };
+        }) {
+            Some(h) => h,
+            None => return skip(),
+        };
 
     thread::sleep(Duration::from_millis(200));
 
@@ -225,7 +230,13 @@ fn test_request_reply_transform() {
     });
     let request_bytes = serde_json::to_vec(&request).expect("serialize");
     client
-        .publish_raw(&topic, &request_bytes, mqtt_wasi::QoS::AtMostOnce, false, Default::default())
+        .publish_raw(
+            &topic,
+            &request_bytes,
+            mqtt_wasi::QoS::AtMostOnce,
+            false,
+            Default::default(),
+        )
         .expect("publish");
 
     let msg = client.recv_raw().expect("recv").expect("no reply");
@@ -243,13 +254,12 @@ fn test_request_reply_transform() {
 
 /// Spawn a consumer for the async client's request/reply pattern.
 /// The async client wraps in a RequestEnvelope, so the consumer reads that format.
-fn spawn_async_echo_consumer(
-    client_id: &str,
-    topic: &str,
-) -> Option<thread::JoinHandle<()>> {
-    spawn_echo_consumer(client_id, topic, |params| {
-        serde_json::json!({"echo": params})
-    })
+fn spawn_async_echo_consumer(client_id: &str, topic: &str) -> Option<thread::JoinHandle<()>> {
+    spawn_echo_consumer(
+        client_id,
+        topic,
+        |params| serde_json::json!({"echo": params}),
+    )
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -257,10 +267,7 @@ async fn test_async_request_reply_single() {
     let id = &uuid::Uuid::new_v4().to_string()[..8];
     let topic = format!("test/mqtt-wasi/async-single-{id}");
 
-    let consumer = match spawn_async_echo_consumer(
-        &format!("mw-async-consumer-{id}"),
-        &topic,
-    ) {
+    let consumer = match spawn_async_echo_consumer(&format!("mw-async-consumer-{id}"), &topic) {
         Some(h) => h,
         None => return skip(),
     };
@@ -270,7 +277,10 @@ async fn test_async_request_reply_single() {
     // amqp_reply_format=false since consumer is also an MQTT client
     let client = match async_connect(&format!("mw-async-requester-{id}"), false).await {
         Some(c) => c,
-        None => { consumer.join().ok(); return skip(); }
+        None => {
+            consumer.join().ok();
+            return skip();
+        }
     };
 
     let result = client
@@ -294,27 +304,34 @@ async fn test_async_concurrent_requests() {
 
     // 3 consumers, one per topic
     let consumer_a = match spawn_echo_consumer(
-        &format!("mw-conc-a-{id}"), &topic_a,
+        &format!("mw-conc-a-{id}"),
+        &topic_a,
         |p| serde_json::json!({"tag": "alpha", "input": p}),
     ) {
         Some(h) => h,
         None => return skip(),
     };
     let consumer_b = spawn_echo_consumer(
-        &format!("mw-conc-b-{id}"), &topic_b,
+        &format!("mw-conc-b-{id}"),
+        &topic_b,
         |p| serde_json::json!({"tag": "bravo", "input": p}),
-    ).unwrap();
+    )
+    .unwrap();
     let consumer_c = spawn_echo_consumer(
-        &format!("mw-conc-c-{id}"), &topic_c,
+        &format!("mw-conc-c-{id}"),
+        &topic_c,
         |p| serde_json::json!({"tag": "charlie", "input": p}),
-    ).unwrap();
+    )
+    .unwrap();
 
     thread::sleep(Duration::from_millis(300));
 
     let client = match async_connect(&format!("mw-conc-req-{id}"), false).await {
         Some(c) => c,
         None => {
-            consumer_a.join().ok(); consumer_b.join().ok(); consumer_c.join().ok();
+            consumer_a.join().ok();
+            consumer_b.join().ok();
+            consumer_c.join().ok();
             return skip();
         }
     };

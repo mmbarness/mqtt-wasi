@@ -89,7 +89,11 @@ impl PubAckPacket {
     pub fn decode(body: &[u8]) -> Result<Self> {
         let mut cur = Cursor::new(body);
         let packet_id = cur.read_u16()?;
-        let reason_code = if cur.remaining() > 0 { cur.read_u8()? } else { 0x00 };
+        let reason_code = if cur.remaining() > 0 {
+            cur.read_u8()?
+        } else {
+            0x00
+        };
         Ok(PubAckPacket {
             packet_id,
             reason_code,

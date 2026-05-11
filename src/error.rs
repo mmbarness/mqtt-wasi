@@ -15,6 +15,10 @@ pub enum Error {
     StringTooLong(usize),
     Timeout,
     UnexpectedPacket(&'static str),
+    AckRejected {
+        packet: &'static str,
+        reason_code: u8,
+    },
     Serialize(String),
     Deserialize(String),
     ConnectionClosed,
@@ -36,6 +40,12 @@ impl fmt::Display for Error {
             Error::ConnectionClosed => write!(f, "connection closed"),
             Error::Timeout => write!(f, "timeout"),
             Error::UnexpectedPacket(msg) => write!(f, "unexpected packet: {msg}"),
+            Error::AckRejected {
+                packet,
+                reason_code,
+            } => {
+                write!(f, "{packet} rejected: 0x{reason_code:02x}")
+            }
             Error::Serialize(msg) => write!(f, "serialize: {msg}"),
             Error::Deserialize(msg) => write!(f, "deserialize: {msg}"),
             #[cfg(feature = "std")]

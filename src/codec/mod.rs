@@ -1,11 +1,11 @@
-pub mod types;
-pub mod encode;
-pub mod decode;
-pub mod properties;
 pub mod connect;
+pub mod decode;
+pub mod encode;
+pub mod ping;
+pub mod properties;
 pub mod publish;
 pub mod subscribe;
-pub mod ping;
+pub mod types;
 
 use crate::codec::types::*;
 use crate::error::{Error, Result};
@@ -28,9 +28,7 @@ impl Packet {
                 Err(Error::UnexpectedPacket("QoS 2 not supported"))
             }
             // Enhanced authentication — not implemented.
-            PacketType::Auth => {
-                Err(Error::UnexpectedPacket("AUTH not supported"))
-            }
+            PacketType::Auth => Err(Error::UnexpectedPacket("AUTH not supported")),
             // Client-to-server only; we shouldn't receive them.
             PacketType::Connect | PacketType::Subscribe | PacketType::Unsubscribe => {
                 Err(Error::UnexpectedPacket("server-only packet type"))

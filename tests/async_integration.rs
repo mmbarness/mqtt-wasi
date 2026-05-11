@@ -17,7 +17,8 @@ fn try_connect(client_id: &str) -> Option<MqttClient> {
 }
 
 async fn try_async_connect(client_id: &str) -> Option<AsyncMqttClient> {
-    match AsyncMqttClient::connect(BROKER, ConnectOptions::new(client_id).with_keep_alive(10)).await {
+    match AsyncMqttClient::connect(BROKER, ConnectOptions::new(client_id).with_keep_alive(10)).await
+    {
         Ok(c) => Some(c),
         Err(_) => {
             eprintln!("local broker not running at {BROKER} — skipping");
@@ -68,7 +69,13 @@ async fn single_request_reply() {
         });
         let reply_bytes = serde_json::to_vec(&reply).unwrap();
         client
-            .publish_raw(&reply_to, &reply_bytes, QoS::AtMostOnce, false, Default::default())
+            .publish_raw(
+                &reply_to,
+                &reply_bytes,
+                QoS::AtMostOnce,
+                false,
+                Default::default(),
+            )
             .unwrap();
 
         client.disconnect().unwrap();
@@ -80,7 +87,10 @@ async fn single_request_reply() {
     // Send an async request
     let client = match try_async_connect("async-requester-single").await {
         Some(c) => c,
-        None => { responder.join().ok(); return; }
+        None => {
+            responder.join().ok();
+            return;
+        }
     };
 
     let result = client
@@ -110,7 +120,11 @@ async fn concurrent_request_reply() {
 
     let client = match try_async_connect("async-requester-concurrent").await {
         Some(c) => c,
-        None => { responder_a.join().ok(); responder_b.join().ok(); return; }
+        None => {
+            responder_a.join().ok();
+            responder_b.join().ok();
+            return;
+        }
     };
 
     // Both requests in flight concurrently
@@ -150,7 +164,13 @@ fn mock_responder(client_id: &str, topic: &str, tag: &str) {
     });
     let reply_bytes = serde_json::to_vec(&reply).unwrap();
     client
-        .publish_raw(&reply_to, &reply_bytes, QoS::AtMostOnce, false, Default::default())
+        .publish_raw(
+            &reply_to,
+            &reply_bytes,
+            QoS::AtMostOnce,
+            false,
+            Default::default(),
+        )
         .unwrap();
 
     client.disconnect().unwrap();

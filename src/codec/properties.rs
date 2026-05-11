@@ -73,7 +73,11 @@ impl Properties {
     pub fn get_byte(&self, id: PropertyId) -> Option<u8> {
         self.entries.iter().find_map(|(pid, val)| {
             if *pid == id {
-                if let PropertyValue::Byte(b) = val { Some(*b) } else { None }
+                if let PropertyValue::Byte(b) = val {
+                    Some(*b)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -83,7 +87,11 @@ impl Properties {
     pub fn get_u16(&self, id: PropertyId) -> Option<u16> {
         self.entries.iter().find_map(|(pid, val)| {
             if *pid == id {
-                if let PropertyValue::U16(v) = val { Some(*v) } else { None }
+                if let PropertyValue::U16(v) = val {
+                    Some(*v)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -93,7 +101,11 @@ impl Properties {
     pub fn get_u32(&self, id: PropertyId) -> Option<u32> {
         self.entries.iter().find_map(|(pid, val)| {
             if *pid == id {
-                if let PropertyValue::U32(v) = val { Some(*v) } else { None }
+                if let PropertyValue::U32(v) = val {
+                    Some(*v)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -103,7 +115,11 @@ impl Properties {
     pub fn get_string(&self, id: PropertyId) -> Option<&str> {
         self.entries.iter().find_map(|(pid, val)| {
             if *pid == id {
-                if let PropertyValue::Str(s) = val { Some(s.as_str()) } else { None }
+                if let PropertyValue::Str(s) = val {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -157,17 +173,22 @@ impl Properties {
     }
 
     fn body_len(&self) -> usize {
-        self.entries.iter().map(|(id, val)| {
-            let id_len = encode::variable_int_len(*id as u32);
-            let val_len = match val {
-                PropertyValue::Byte(_) => 1,
-                PropertyValue::U16(_) => 2,
-                PropertyValue::U32(_) => 4,
-                PropertyValue::Str(s) => encode::string_len(s),
-                PropertyValue::StringPair(k, v) => encode::string_len(k) + encode::string_len(v),
-            };
-            id_len + val_len
-        }).sum()
+        self.entries
+            .iter()
+            .map(|(id, val)| {
+                let id_len = encode::variable_int_len(*id as u32);
+                let val_len = match val {
+                    PropertyValue::Byte(_) => 1,
+                    PropertyValue::U16(_) => 2,
+                    PropertyValue::U32(_) => 4,
+                    PropertyValue::Str(s) => encode::string_len(s),
+                    PropertyValue::StringPair(k, v) => {
+                        encode::string_len(k) + encode::string_len(v)
+                    }
+                };
+                id_len + val_len
+            })
+            .sum()
     }
 
     /// Decode properties from a cursor. Reads the length prefix, then decodes entries.
@@ -176,17 +197,26 @@ impl Properties {
         if prop_len == 0 {
             return Ok(Properties::new());
         }
+        if cur.remaining() < prop_len {
+            return Err(Error::MalformedPacket("property length exceeds packet"));
+        }
 
         let start = cur.position();
+        let end = start
+            .checked_add(prop_len)
+            .ok_or(Error::MalformedPacket("property length overflow"))?;
         let mut props = Properties::new();
 
-        while cur.position() - start < prop_len {
+        while cur.position() < end {
             let id_byte = cur.read_variable_int()? as u8;
 
             // Skip unknown property IDs by consuming their wire bytes.
             // MQTT v5 spec defines the data type for every property ID.
             let Some(id) = PropertyId::from_u8(id_byte) else {
                 skip_property_value(cur, id_byte)?;
+                if cur.position() > end {
+                    return Err(Error::MalformedPacket("property exceeded declared length"));
+                }
                 continue;
             };
 
@@ -207,7 +237,14 @@ impl Properties {
                     PropertyValue::StringPair(k, v)
                 }
             };
+            if cur.position() > end {
+                return Err(Error::MalformedPacket("property exceeded declared length"));
+            }
             props.push(id, value);
+        }
+
+        if cur.position() != end {
+            return Err(Error::MalformedPacket("property length mismatch"));
         }
 
         Ok(props)
@@ -291,8 +328,7 @@ mod tests {
 
     #[test]
     fn user_property_round_trip() {
-        let props = Properties::new()
-            .user("traceparent", "00-abc-def-01");
+        let props = Properties::new().user("traceparent", "00-abc-def-01");
         let mut buf = Vec::new();
         props.encode(&mut buf).unwrap();
 
@@ -315,5 +351,25 @@ mod tests {
         let decoded = Properties::decode(&mut cur).unwrap();
         assert_eq!(decoded.get_u16(PropertyId::ReceiveMaximum), Some(100));
         assert_eq!(decoded.get_byte(PropertyId::MaximumQoS), Some(1));
+    }
+
+    #[test]
+    fn property_length_cannot_overrun_declared_section() {
+        // Declares a 2-byte property section, but ReasonString needs its
+        // property ID plus a 2-byte string length before the value.
+        let mut cur = Cursor::new(&[0x02, 0x1F, 0x00, 0x03, b'a', b'b', b'c']);
+        assert!(matches!(
+            Properties::decode(&mut cur),
+            Err(Error::MalformedPacket("property exceeded declared length"))
+        ));
+    }
+
+    #[test]
+    fn property_length_cannot_exceed_remaining_packet() {
+        let mut cur = Cursor::new(&[0x05, 0x24, 0x01]);
+        assert!(matches!(
+            Properties::decode(&mut cur),
+            Err(Error::MalformedPacket("property length exceeds packet"))
+        ));
     }
 }

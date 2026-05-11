@@ -31,11 +31,11 @@ Three layers:
 
 ### Async client design
 
-The async client uses cooperative polling over one non-blocking TCP socket. There is no I/O reactor on wasip2, so each `RequestFuture` self-wakes (`cx.waker().wake_by_ref()`) and pumps the shared socket when polled. Packets are dispatched by correlation ID to the correct pending request.
+The async client uses cooperative polling over one non-blocking TCP socket. There is no I/O reactor on wasip2, so each `RequestFuture` pumps the shared socket when polled and uses a short idle backoff before self-waking. Packets are dispatched by correlation ID to the correct pending request.
 
 Shared state is `Rc<RefCell<SharedInner>>` — single-threaded only. Futures are `!Send`, so `tokio::join!` works but `tokio::spawn` does not (use `spawn_local`).
 
-The CONNECT/CONNACK handshake is done in blocking mode. After CONNACK, the socket switches to non-blocking. Writes temporarily flip back to blocking to avoid `WouldBlock` on `write_all`.
+The CONNECT/CONNACK handshake and the client-scoped reply-prefix subscription are done in blocking mode. After that, the socket switches to non-blocking. Writes temporarily flip back to blocking to avoid `WouldBlock` on `write_all`.
 
 ### Transport trait
 

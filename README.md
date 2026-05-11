@@ -59,7 +59,7 @@ async fn main() {
 }
 ```
 
-Each `request()` subscribes to a reply topic with a correlation ID, publishes the request, and waits for the correlated reply. Multiple requests multiplex over one non-blocking socket.
+The async client subscribes once to a client-scoped reply prefix, publishes each request with a correlation ID, and dispatches replies back to the matching future. Multiple requests multiplex over one non-blocking socket.
 
 ### TLS
 
@@ -104,7 +104,10 @@ if let Some(trace) = TraceContext::from_properties(&msg.properties) {
 
 ```bash
 cargo build --target wasm32-wasip2 --release
+cargo build --target wasm32-wasip2 --release --features tls
 ```
+
+This validates the library for WASI. To produce runnable `.wasm` binaries, build one of the examples, e.g. `cargo build --target wasm32-wasip2 --release` from `examples/pubsub`.
 
 Binary sizes (wasm32-wasip2, with serde_json, LTO, `opt-level = "z"`, `panic = "abort"`):
 
@@ -123,8 +126,8 @@ wasmtime run -S inherit-network,allow-ip-name-lookup your_app.wasm
 ## Design
 
 - **Protocol layer** (`codec/`) is `no_std` compatible (alloc only). No `bytes` crate, no derive macros, no `hashbrown`. Encodes to `Vec<u8>`, decodes from `&[u8]` via a lightweight `Cursor`.
-- **Sync client** (`client.rs`). Blocking `TcpStream` with read timeouts for keep-alive.
-- **Async client** (`async_client.rs`). Cooperative non-blocking I/O over one socket. Each `request()` Future pumps the shared socket when polled, dispatching packets by correlation ID. Uses `Rc<RefCell<...>>` (single-threaded, `!Send`). Works with `tokio::join!` but not `tokio::spawn` (use `spawn_local`).
+- **Sync client** (`client.rs`). Blocking `TcpStream` with incremental frame parsing, read timeouts for keep-alive, and partial-frame safety across timeouts.
+- **Async client** (`async_client.rs`). Cooperative non-blocking I/O over one socket. The client subscribes once to a reply prefix; each `request()` Future publishes and pumps the shared socket when polled, dispatching packets by correlation ID. Uses `Rc<RefCell<...>>` (single-threaded, `!Send`). Works with `tokio::join!` but not `tokio::spawn` (use `spawn_local`).
 - **Frame reader** (`frame.rs`). Incremental MQTT frame parser for partial non-blocking reads.
 - **TLS** (`tls.rs`, feature-gated). `TlsTransport` wraps rustls `StreamOwned` and implements `Transport`. Uses [`rustls-rustcrypto`](https://github.com/RustCrypto/rustls-rustcrypto) (pure Rust, no C dependencies) so TLS compiles to Wasm. The underlying RustCrypto crates are mature; the rustls glue layer is alpha but covers all standard TLS 1.2/1.3 cipher suites.
 - **Properties** stored as `Vec<(PropertyId, PropertyValue)>`. linear scan beats hashing for the typical 0-5 items per packet. Unknown property IDs are skipped rather than erroring.

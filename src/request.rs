@@ -3,18 +3,18 @@ use std::io;
 use std::net::TcpStream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::async_client::{maybe_ping, next_packet_id, write_blocking, PendingRequest, Shared, SharedInner};
-use crate::codec::properties::Properties;
+use crate::async_client::{maybe_ping, write_blocking, PendingRequest, Shared, SharedInner};
 use crate::codec::types::*;
 use crate::error::{Error, Result};
 use crate::transport::Transport;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-const REPLY_TOPIC_PREFIX: &str = "egress/reply/";
+const IDLE_POLL_BACKOFF: Duration = Duration::from_millis(1);
 
 /// Outgoing request envelope.
 #[derive(Serialize)]
@@ -56,22 +56,20 @@ enum RequestState {
 pub struct RequestFuture<T: Transport = TcpStream> {
     inner: Shared<T>,
     correlation_id: String,
-    reply_topic: String,
     state: RequestState,
     deadline: Instant,
 }
 
 impl<T: Transport> RequestFuture<T> {
-    pub(crate) fn new<Req: Serialize>(
-        inner: Shared<T>,
-        topic: String,
-        payload: &Req,
-    ) -> Self {
+    pub(crate) fn new<Req: Serialize>(inner: Shared<T>, topic: String, payload: &Req) -> Self {
         let correlation_id = generate_correlation_id();
-        // MQTT subscription always uses slashes (MQTT topic separator)
-        let reply_topic = format!("{REPLY_TOPIC_PREFIX}{correlation_id}");
-        // replyTo in envelope: dots for AMQP repliers, slashes for MQTT repliers
-        let amqp_mode = inner.borrow().amqp_reply_format;
+        let (reply_topic, amqp_mode) = {
+            let inner = inner.borrow();
+            (
+                format!("{}{}", inner.reply_topic_prefix, correlation_id),
+                inner.amqp_reply_format,
+            )
+        };
         let reply_to = if amqp_mode {
             reply_topic.replace('/', ".")
         } else {
@@ -85,13 +83,11 @@ impl<T: Transport> RequestFuture<T> {
             correlation_id: &correlation_id,
             reply_to: &reply_to,
         };
-        let payload_json = serde_json::to_vec(&envelope)
-            .expect("serialization should not fail");
+        let payload_json = serde_json::to_vec(&envelope).expect("serialization should not fail");
 
         RequestFuture {
             inner,
             correlation_id,
-            reply_topic,
             state: RequestState::Init {
                 topic,
                 payload_json,
@@ -111,6 +107,9 @@ impl<T: Transport> Future for RequestFuture<T> {
         {
             let inner = this.inner.borrow();
             if let Some(ref _e) = inner.error {
+                drop(inner);
+                this.inner.borrow_mut().pending.remove(&this.correlation_id);
+                this.state = RequestState::Done;
                 return Poll::Ready(Err(Error::ConnectionClosed));
             }
         }
@@ -124,7 +123,10 @@ impl<T: Transport> Future for RequestFuture<T> {
 
         loop {
             match std::mem::replace(&mut this.state, RequestState::Done) {
-                RequestState::Init { topic, payload_json } => {
+                RequestState::Init {
+                    topic,
+                    payload_json,
+                } => {
                     let mut inner = this.inner.borrow_mut();
 
                     // Register pending slot
@@ -136,16 +138,6 @@ impl<T: Transport> Future for RequestFuture<T> {
                         },
                     );
 
-                    // Send SUBSCRIBE for reply topic
-                    let sub_id = next_packet_id(&mut inner);
-                    let sub = SubscribePacket {
-                        packet_id: sub_id,
-                        filters: vec![(this.reply_topic.clone(), QoS::AtMostOnce)],
-                        properties: Properties::new(),
-                    };
-                    let sub_bytes = sub.encode()?;
-                    write_blocking(&mut inner.stream, &sub_bytes)?;
-
                     // Send PUBLISH with request envelope
                     let pub_pkt = PublishPacket {
                         topic,
@@ -154,11 +146,21 @@ impl<T: Transport> Future for RequestFuture<T> {
                         qos: QoS::AtMostOnce,
                         retain: false,
                         dup: false,
-                        properties: Properties::new(),
+                        properties: Default::default(),
                     };
-                    let pub_bytes = pub_pkt.encode()?;
-                    write_blocking(&mut inner.stream, &pub_bytes)?;
-                    inner.last_activity = Instant::now();
+                    let pub_bytes = match pub_pkt.encode() {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            inner.pending.remove(&this.correlation_id);
+                            this.state = RequestState::Done;
+                            return Poll::Ready(Err(e));
+                        }
+                    };
+                    if let Err(e) = write_blocking(&mut inner, &pub_bytes) {
+                        inner.pending.remove(&this.correlation_id);
+                        this.state = RequestState::Done;
+                        return Poll::Ready(Err(e));
+                    }
 
                     drop(inner);
                     this.state = RequestState::Waiting;
@@ -167,24 +169,20 @@ impl<T: Transport> Future for RequestFuture<T> {
 
                 RequestState::Waiting => {
                     // Pump the socket — cooperative polling
-                    pump_socket(&this.inner)?;
+                    let pump_result = match pump_socket(&this.inner) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            this.inner.borrow_mut().pending.remove(&this.correlation_id);
+                            this.state = RequestState::Done;
+                            return Poll::Ready(Err(e));
+                        }
+                    };
 
                     // Check our slot
                     let mut inner = this.inner.borrow_mut();
                     if let Some(pending) = inner.pending.get_mut(&this.correlation_id) {
                         if let Some(result) = pending.result.take() {
                             inner.pending.remove(&this.correlation_id);
-
-                            // Fire-and-forget UNSUBSCRIBE
-                            let unsub_id = next_packet_id(&mut inner);
-                            let unsub = UnsubscribePacket {
-                                packet_id: unsub_id,
-                                filters: vec![this.reply_topic.clone()],
-                                properties: Properties::new(),
-                            };
-                            if let Ok(bytes) = unsub.encode() {
-                                let _ = write_blocking(&mut inner.stream, &bytes);
-                            }
                             drop(inner);
 
                             this.state = RequestState::Done;
@@ -192,7 +190,9 @@ impl<T: Transport> Future for RequestFuture<T> {
                                 Ok(payload_bytes) => {
                                     match serde_json::from_slice::<ReplyEnvelope>(&payload_bytes) {
                                         Ok(env) => Poll::Ready(Ok(env.result)),
-                                        Err(e) => Poll::Ready(Err(Error::Deserialize(e.to_string()))),
+                                        Err(e) => {
+                                            Poll::Ready(Err(Error::Deserialize(e.to_string())))
+                                        }
                                     }
                                 }
                                 Err(e) => Poll::Ready(Err(e)),
@@ -200,11 +200,16 @@ impl<T: Transport> Future for RequestFuture<T> {
                         }
                         // Not ready — update waker and yield
                         pending.waker = Some(cx.waker().clone());
+                    } else {
+                        this.state = RequestState::Done;
+                        return Poll::Ready(Err(Error::ConnectionClosed));
                     }
                     drop(inner);
 
                     this.state = RequestState::Waiting;
-                    // Self-wake: no I/O reactor to wake us
+                    if pump_result == PumpResult::Idle {
+                        thread::sleep(IDLE_POLL_BACKOFF);
+                    }
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
@@ -217,13 +222,29 @@ impl<T: Transport> Future for RequestFuture<T> {
     }
 }
 
+impl<T: Transport> Drop for RequestFuture<T> {
+    fn drop(&mut self) {
+        if !matches!(self.state, RequestState::Done) {
+            self.inner.borrow_mut().pending.remove(&self.correlation_id);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PumpResult {
+    Active,
+    Idle,
+}
+
 /// Read available data from the non-blocking socket, parse packets, dispatch.
-fn pump_socket<T: Transport>(shared: &Shared<T>) -> Result<()> {
+fn pump_socket<T: Transport>(shared: &Shared<T>) -> Result<PumpResult> {
     let mut inner = shared.borrow_mut();
 
     if inner.error.is_some() {
-        return Ok(());
+        return Ok(PumpResult::Idle);
     }
+
+    let mut active = false;
 
     // Non-blocking read loop
     let mut tmp = [0u8; 8192];
@@ -238,9 +259,11 @@ fn pump_socket<T: Transport>(shared: &Shared<T>) -> Result<()> {
                         w.wake();
                     }
                 }
-                return Ok(());
+                return Ok(PumpResult::Active);
             }
             Ok(n) => {
+                active = true;
+                inner.last_read_at = Instant::now();
                 inner.frame_reader.push(&tmp[..n]);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -254,7 +277,10 @@ fn pump_socket<T: Transport>(shared: &Shared<T>) -> Result<()> {
     // Decode and dispatch all complete packets
     loop {
         match inner.frame_reader.try_decode() {
-            Ok(Some(packet)) => dispatch_packet(&mut inner, packet)?,
+            Ok(Some(packet)) => {
+                active = true;
+                dispatch_packet(&mut inner, packet)?;
+            }
             Ok(None) => break,
             Err(e) => {
                 inner.error = Some(Error::MalformedPacket("frame decode error"));
@@ -264,21 +290,25 @@ fn pump_socket<T: Transport>(shared: &Shared<T>) -> Result<()> {
     }
 
     maybe_ping(&mut inner)?;
-    Ok(())
+    Ok(if active {
+        PumpResult::Active
+    } else {
+        PumpResult::Idle
+    })
 }
 
-fn dispatch_packet<T: Transport>(
-    inner: &mut SharedInner<T>,
-    packet: Packet,
-) -> Result<()> {
+fn dispatch_packet<T: Transport>(inner: &mut SharedInner<T>, packet: Packet) -> Result<()> {
     match packet {
         Packet::Publish(pub_pkt) => {
             // ACK QoS 1
             if pub_pkt.qos == QoS::AtLeastOnce {
                 if let Some(id) = pub_pkt.packet_id {
-                    let ack = PubAckPacket { packet_id: id, reason_code: 0x00 };
+                    let ack = PubAckPacket {
+                        packet_id: id,
+                        reason_code: 0x00,
+                    };
                     let bytes = ack.encode()?;
-                    write_blocking(&mut inner.stream, &bytes)?;
+                    write_blocking(inner, &bytes)?;
                 }
             }
 
@@ -294,7 +324,7 @@ fn dispatch_packet<T: Transport>(
             }
         }
         Packet::PingResp => {
-            inner.last_activity = Instant::now();
+            inner.last_read_at = Instant::now();
         }
         Packet::Disconnect(disc) => {
             inner.error = Some(Error::ConnectionRefused(disc.reason_code));
@@ -313,4 +343,98 @@ fn dispatch_packet<T: Transport>(
 
 fn generate_correlation_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::FrameReader;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::io;
+    use std::rc::Rc;
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+
+    struct MockTransport {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Transport for MockTransport {
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            self.writes.push(buf.to_vec());
+            Ok(())
+        }
+
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        fn read_exact(&mut self, _buf: &mut [u8]) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_read_timeout(&self, _dur: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_shared() -> Shared<MockTransport> {
+        let now = Instant::now();
+        Rc::new(RefCell::new(SharedInner {
+            stream: MockTransport { writes: Vec::new() },
+            frame_reader: FrameReader::new(),
+            pending: HashMap::new(),
+            next_packet_id: 1,
+            keep_alive_secs: 60,
+            last_read_at: now,
+            last_write_at: now,
+            error: None,
+            amqp_reply_format: false,
+            reply_topic_prefix: String::from("egress/reply/test-client/"),
+        }))
+    }
+
+    fn noop_waker() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            raw_waker()
+        }
+        unsafe fn wake(_: *const ()) {}
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop(_: *const ()) {}
+
+        fn raw_waker() -> RawWaker {
+            RawWaker::new(
+                std::ptr::null(),
+                &RawWakerVTable::new(clone, wake, wake_by_ref, drop),
+            )
+        }
+
+        unsafe { Waker::from_raw(raw_waker()) }
+    }
+
+    #[test]
+    fn drop_in_flight_request_removes_pending_slot() {
+        let shared = test_shared();
+        let mut future = RequestFuture::new(
+            shared.clone(),
+            String::from("request/topic"),
+            &serde_json::json!({"hello": "world"}),
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(std::future::Future::poll(Pin::new(&mut future), &mut cx).is_pending());
+        assert_eq!(shared.borrow().pending.len(), 1);
+
+        drop(future);
+        assert!(shared.borrow().pending.is_empty());
+    }
 }

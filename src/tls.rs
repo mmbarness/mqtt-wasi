@@ -31,24 +31,21 @@ impl TlsTransport {
     /// The `addr` should be `host:port` (e.g. `"broker.example.com:8883"`).
     /// The hostname is extracted for SNI and certificate verification.
     pub fn connect(addr: &str) -> io::Result<Self> {
-        let config = default_tls_config()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let config = default_tls_config().map_err(io::Error::other)?;
         Self::connect_with_config(addr, config)
     }
 
     /// Connect with a custom `rustls::ClientConfig`.
     pub fn connect_with_config(addr: &str, config: Arc<ClientConfig>) -> io::Result<Self> {
-        let host = addr
-            .split(':')
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing host in address"))?;
+        let host = addr.split(':').next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "missing host in address")
+        })?;
 
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
         let tcp = TcpStream::connect(addr)?;
-        let conn = ClientConnection::new(config, server_name)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let conn = ClientConnection::new(config, server_name).map_err(io::Error::other)?;
 
         Ok(Self {
             stream: StreamOwned::new(conn, tcp),
@@ -93,12 +90,10 @@ fn default_tls_config() -> std::result::Result<Arc<ClientConfig>, rustls::Error>
     let root_store =
         rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let config = ClientConfig::builder_with_provider(Arc::new(
-        rustls_rustcrypto::provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(root_store)
-    .with_no_client_auth();
+    let config = ClientConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
 
     Ok(Arc::new(config))
 }

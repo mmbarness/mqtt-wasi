@@ -96,8 +96,7 @@ mod tls_tests {
                 .unwrap();
 
             let msg = client.recv_raw().unwrap().unwrap();
-            let envelope: serde_json::Value =
-                serde_json::from_slice(&msg.payload).unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&msg.payload).unwrap();
             let reply_to = envelope["replyTo"].as_str().unwrap().to_string();
             let correlation_id = envelope["correlationId"].as_str().unwrap().to_string();
 

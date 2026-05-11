@@ -65,7 +65,8 @@ fn subscribe_and_receive() {
         Some(c) => c,
         None => return,
     };
-    sub.subscribe_raw("test/roundtrip", QoS::AtMostOnce).unwrap();
+    sub.subscribe_raw("test/roundtrip", QoS::AtMostOnce)
+        .unwrap();
 
     thread::sleep(Duration::from_millis(100));
 
@@ -98,10 +99,14 @@ fn trace_context_propagation() {
 
     let mut publ = MqttClient::connect(BROKER, ConnectOptions::new("test-trace-pub")).unwrap();
     let trace = TraceContext::new_root([0xAA; 16], [0xBB; 8]);
-    publ.publish_traced("test/traced", &"hello", &trace).unwrap();
+    publ.publish_traced("test/traced", &"hello", &trace)
+        .unwrap();
     publ.disconnect().unwrap();
 
-    let msg = sub.recv_raw().unwrap().expect("should receive traced message");
+    let msg = sub
+        .recv_raw()
+        .unwrap()
+        .expect("should receive traced message");
     let extracted = TraceContext::from_properties(&msg.properties).unwrap();
     assert_eq!(extracted.trace_id, [0xAA; 16]);
     assert_eq!(extracted.span_id, [0xBB; 8]);

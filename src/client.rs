@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,7 @@ use crate::codec::ping::PINGREQ_BYTES;
 use crate::codec::properties::Properties;
 use crate::codec::types::*;
 use crate::error::{Error, Result};
+use crate::frame::FrameReader;
 use crate::options::ConnectOptions;
 use crate::trace::TraceContext;
 use crate::transport::Transport;
@@ -18,9 +20,11 @@ use crate::transport::Transport;
 /// For alternative transports (e.g. WasmEdge), use `MqttClient::connect_with()`.
 pub struct MqttClient<T: Transport = TcpStream> {
     stream: T,
+    frame_reader: FrameReader,
     next_packet_id: u16,
     keep_alive_secs: u16,
-    last_activity: Instant,
+    last_read_at: Instant,
+    last_write_at: Instant,
 }
 
 /// A received message with a deserialized payload.
@@ -60,14 +64,16 @@ impl MqttClient<TcpStream> {
 impl<T: Transport> MqttClient<T> {
     /// Connect using a caller-provided transport.
     pub fn connect_with(stream: T, options: ConnectOptions) -> Result<Self> {
-        let timeout = Duration::from_secs(options.keep_alive_secs as u64 / 2);
-        stream.set_read_timeout(Some(timeout))?;
+        stream.set_read_timeout(read_timeout(options.keep_alive_secs))?;
 
+        let now = Instant::now();
         let mut client = Self {
             stream,
+            frame_reader: FrameReader::new(),
             next_packet_id: 1,
             keep_alive_secs: options.keep_alive_secs,
-            last_activity: Instant::now(),
+            last_read_at: now,
+            last_write_at: now,
         };
 
         // Send CONNECT
@@ -82,7 +88,7 @@ impl<T: Transport> MqttClient<T> {
         };
         let bytes = connect.encode()?;
         client.stream.write_all(&bytes)?;
-        client.last_activity = Instant::now();
+        client.last_write_at = Instant::now();
 
         // Read CONNACK
         let packet = client.read_packet()?;
@@ -100,35 +106,14 @@ impl<T: Transport> MqttClient<T> {
 
     /// Publish a serializable payload as JSON to a topic (QoS 0).
     pub fn publish<P: Serialize>(&mut self, topic: &str, payload: &P) -> Result<()> {
-        let json = serde_json::to_vec(payload)
-            .map_err(|e| Error::Serialize(e.to_string()))?;
+        let json = serde_json::to_vec(payload).map_err(|e| Error::Serialize(e.to_string()))?;
         self.publish_raw(topic, &json, QoS::AtMostOnce, false, Properties::new())
     }
 
     /// Publish with QoS 1 (waits for PUBACK).
     pub fn publish_qos1<P: Serialize>(&mut self, topic: &str, payload: &P) -> Result<()> {
-        let json = serde_json::to_vec(payload)
-            .map_err(|e| Error::Serialize(e.to_string()))?;
-        let packet_id = self.next_packet_id();
-
-        let pkt = PublishPacket {
-            topic: String::from(topic),
-            packet_id: Some(packet_id),
-            payload: json,
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            dup: false,
-            properties: Properties::new(),
-        };
-        self.send_encoded(&pkt.encode()?)?;
-
-        loop {
-            match self.read_packet_or_ping()? {
-                Some(Packet::PubAck(ack)) if ack.packet_id == packet_id => return Ok(()),
-                Some(_) => continue,
-                None => continue,
-            }
-        }
+        let json = serde_json::to_vec(payload).map_err(|e| Error::Serialize(e.to_string()))?;
+        self.publish_raw(topic, &json, QoS::AtLeastOnce, false, Properties::new())
     }
 
     /// Publish with trace context auto-injected into User Properties.
@@ -138,8 +123,7 @@ impl<T: Transport> MqttClient<T> {
         payload: &P,
         trace: &TraceContext,
     ) -> Result<()> {
-        let json = serde_json::to_vec(payload)
-            .map_err(|e| Error::Serialize(e.to_string()))?;
+        let json = serde_json::to_vec(payload).map_err(|e| Error::Serialize(e.to_string()))?;
         let mut props = Properties::new();
         trace.inject(&mut props);
         self.publish_raw(topic, &json, QoS::AtMostOnce, false, props)
@@ -169,7 +153,13 @@ impl<T: Transport> MqttClient<T> {
             dup: false,
             properties,
         };
-        self.send_encoded(&pkt.encode()?)
+        self.send_encoded(&pkt.encode()?)?;
+
+        if let Some(packet_id) = packet_id {
+            self.wait_for_puback(packet_id)
+        } else {
+            Ok(())
+        }
     }
 
     /// Subscribe to a topic and return a typed message iterator.
@@ -197,6 +187,7 @@ impl<T: Transport> MqttClient<T> {
         loop {
             match self.read_packet_or_ping()? {
                 Some(Packet::SubAck(ack)) if ack.packet_id == packet_id => {
+                    validate_ack_codes("SUBACK", &ack.reason_codes, 1)?;
                     return Ok(ack.reason_codes);
                 }
                 Some(_) => continue,
@@ -217,7 +208,10 @@ impl<T: Transport> MqttClient<T> {
 
         loop {
             match self.read_packet_or_ping()? {
-                Some(Packet::UnsubAck(ack)) if ack.packet_id == packet_id => return Ok(()),
+                Some(Packet::UnsubAck(ack)) if ack.packet_id == packet_id => {
+                    validate_ack_codes("UNSUBACK", &ack.reason_codes, 1)?;
+                    return Ok(());
+                }
                 Some(_) => continue,
                 None => continue,
             }
@@ -261,7 +255,7 @@ impl<T: Transport> MqttClient<T> {
 
     fn send_encoded(&mut self, bytes: &[u8]) -> Result<()> {
         self.stream.write_all(bytes)?;
-        self.last_activity = Instant::now();
+        self.last_write_at = Instant::now();
         Ok(())
     }
 
@@ -284,9 +278,12 @@ impl<T: Transport> MqttClient<T> {
 
     fn read_packet_or_ping(&mut self) -> Result<Option<Packet>> {
         match self.read_packet() {
-            Ok(pkt) => Ok(Some(pkt)),
-            Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut
-                || e.kind() == std::io::ErrorKind::WouldBlock =>
+            Ok(pkt) => {
+                self.maybe_send_ping()?;
+                Ok(Some(pkt))
+            }
+            Err(Error::Io(ref e))
+                if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock =>
             {
                 self.maybe_send_ping()?;
                 Ok(None)
@@ -296,47 +293,86 @@ impl<T: Transport> MqttClient<T> {
     }
 
     fn maybe_send_ping(&mut self) -> Result<()> {
-        let elapsed = self.last_activity.elapsed();
-        if elapsed >= Duration::from_secs(self.keep_alive_secs as u64 / 2) {
+        let Some(interval) = ping_interval(self.keep_alive_secs) else {
+            return Ok(());
+        };
+
+        if self.last_write_at.elapsed() >= interval {
             self.stream.write_all(&PINGREQ_BYTES)?;
-            self.last_activity = Instant::now();
+            self.last_write_at = Instant::now();
         }
         Ok(())
     }
 
     fn read_packet(&mut self) -> Result<Packet> {
-        let mut first = [0u8; 1];
-        self.stream.read_exact(&mut first)?;
-
-        let mut remaining_length: u32 = 0;
-        let mut multiplier: u32 = 1;
         loop {
-            let mut byte = [0u8; 1];
-            self.stream.read_exact(&mut byte)?;
-            remaining_length += (byte[0] as u32 & 0x7F) * multiplier;
-            if byte[0] & 0x80 == 0 {
-                break;
+            if let Some(packet) = self.frame_reader.try_decode()? {
+                self.last_read_at = Instant::now();
+                return Ok(packet);
             }
-            multiplier *= 128;
-            if multiplier > 128 * 128 * 128 {
-                return Err(Error::MalformedPacket("variable int too long"));
+
+            let mut tmp = [0u8; 8192];
+            match self.stream.read(&mut tmp) {
+                Ok(0) => return Err(Error::ConnectionClosed),
+                Ok(n) => {
+                    self.last_read_at = Instant::now();
+                    self.frame_reader.push(&tmp[..n]);
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(Error::Io(e)),
             }
         }
-
-        let mut body = vec![0u8; remaining_length as usize];
-        if remaining_length > 0 {
-            self.stream.read_exact(&mut body)?;
-        }
-
-        let header = FixedHeader {
-            packet_type: PacketType::from_u8(first[0] >> 4)?,
-            flags: first[0] & 0x0F,
-            remaining_length,
-        };
-
-        self.last_activity = Instant::now();
-        Packet::decode(header, &body)
     }
+
+    fn wait_for_puback(&mut self, packet_id: u16) -> Result<()> {
+        loop {
+            match self.read_packet_or_ping()? {
+                Some(Packet::PubAck(ack)) if ack.packet_id == packet_id => {
+                    validate_ack_code("PUBACK", ack.reason_code)?;
+                    return Ok(());
+                }
+                Some(_) => continue,
+                None => continue,
+            }
+        }
+    }
+}
+
+pub(crate) fn ping_interval(keep_alive_secs: u16) -> Option<Duration> {
+    if keep_alive_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs((keep_alive_secs as u64 / 2).max(1)))
+    }
+}
+
+fn read_timeout(keep_alive_secs: u16) -> Option<Duration> {
+    ping_interval(keep_alive_secs)
+}
+
+pub(crate) fn validate_ack_code(packet: &'static str, reason_code: u8) -> Result<()> {
+    if reason_code >= 0x80 {
+        Err(Error::AckRejected {
+            packet,
+            reason_code,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_ack_codes(
+    packet: &'static str,
+    reason_codes: &[u8],
+    expected: usize,
+) -> Result<()> {
+    if reason_codes.len() != expected {
+        return Err(Error::MalformedPacket("ack reason code count mismatch"));
+    }
+    for &reason_code in reason_codes {
+        validate_ack_code(packet, reason_code)?;
+    }
+    Ok(())
 }
 
 impl<'a, P: DeserializeOwned, T: Transport> Iterator for Subscription<'a, P, T> {
@@ -359,6 +395,193 @@ impl<'a, P: DeserializeOwned, T: Transport> Iterator for Subscription<'a, P, T> 
             }
             Ok(None) => None,
             Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io;
+
+    enum ReadStep {
+        Data(Vec<u8>),
+        Error(ErrorKind),
+        Eof,
+    }
+
+    struct MockTransport {
+        reads: VecDeque<ReadStep>,
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl MockTransport {
+        fn new(reads: impl IntoIterator<Item = ReadStep>) -> Self {
+            Self {
+                reads: reads.into_iter().collect(),
+                writes: Vec::new(),
+            }
+        }
+    }
+
+    impl Transport for MockTransport {
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            self.writes.push(buf.to_vec());
+            Ok(())
+        }
+
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.reads.pop_front().unwrap_or(ReadStep::Eof) {
+                ReadStep::Data(data) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok(n)
+                }
+                ReadStep::Error(kind) => Err(io::Error::from(kind)),
+                ReadStep::Eof => Ok(0),
+            }
+        }
+
+        fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+            let mut read = 0;
+            while read < buf.len() {
+                let n = self.read(&mut buf[read..])?;
+                if n == 0 {
+                    return Err(io::Error::from(ErrorKind::UnexpectedEof));
+                }
+                read += n;
+            }
+            Ok(())
+        }
+
+        fn set_nonblocking(&mut self, _nonblocking: bool) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_read_timeout(&self, _dur: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn shutdown(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn client_with(stream: MockTransport, keep_alive_secs: u16) -> MqttClient<MockTransport> {
+        let now = Instant::now();
+        MqttClient {
+            stream,
+            frame_reader: FrameReader::new(),
+            next_packet_id: 1,
+            keep_alive_secs,
+            last_read_at: now,
+            last_write_at: now - Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn timeout_after_partial_frame_preserves_buffer() {
+        let pkt = PublishPacket {
+            topic: String::from("t"),
+            packet_id: None,
+            payload: b"ok".to_vec(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
+            properties: Properties::new(),
+        };
+        let bytes = pkt.encode().unwrap();
+        let split = 3;
+        let stream = MockTransport::new([
+            ReadStep::Data(bytes[..split].to_vec()),
+            ReadStep::Error(ErrorKind::TimedOut),
+            ReadStep::Data(bytes[split..].to_vec()),
+        ]);
+        let mut client = client_with(stream, 10);
+
+        assert!(client.read_packet_or_ping().unwrap().is_none());
+        let packet = client.read_packet_or_ping().unwrap().unwrap();
+
+        match packet {
+            Packet::Publish(publish) => {
+                assert_eq!(publish.topic, "t");
+                assert_eq!(publish.payload, b"ok");
+            }
+            other => panic!("expected publish, got {other:?}"),
+        }
+        assert_eq!(client.stream.writes, vec![PINGREQ_BYTES.to_vec()]);
+    }
+
+    #[test]
+    fn keepalive_zero_disables_ping() {
+        let stream = MockTransport::new([ReadStep::Error(ErrorKind::TimedOut)]);
+        let mut client = client_with(stream, 0);
+
+        assert!(client.read_packet_or_ping().unwrap().is_none());
+        assert!(client.stream.writes.is_empty());
+    }
+
+    #[test]
+    fn qos1_publish_surfaces_negative_puback() {
+        let puback = PubAckPacket {
+            packet_id: 1,
+            reason_code: 0x80,
+        }
+        .encode()
+        .unwrap();
+        let stream = MockTransport::new([ReadStep::Data(puback)]);
+        let mut client = client_with(stream, 10);
+
+        let err = client
+            .publish_raw("t", b"payload", QoS::AtLeastOnce, false, Properties::new())
+            .unwrap_err();
+
+        match err {
+            Error::AckRejected {
+                packet: "PUBACK",
+                reason_code: 0x80,
+            } => {}
+            other => panic!("expected negative PUBACK, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subscribe_surfaces_negative_suback() {
+        let suback = Packet::SubAck(SubAckPacket {
+            packet_id: 1,
+            reason_codes: vec![0x80],
+        });
+        let bytes = match suback {
+            Packet::SubAck(ack) => {
+                let mut body = Vec::new();
+                crate::codec::encode::encode_u16(&mut body, ack.packet_id);
+                Properties::new().encode(&mut body).unwrap();
+                body.extend_from_slice(&ack.reason_codes);
+                let mut packet = Vec::new();
+                crate::codec::encode::encode_fixed_header(
+                    &mut packet,
+                    PacketType::SubAck,
+                    0,
+                    body.len() as u32,
+                )
+                .unwrap();
+                packet.extend_from_slice(&body);
+                packet
+            }
+            _ => unreachable!(),
+        };
+        let stream = MockTransport::new([ReadStep::Data(bytes)]);
+        let mut client = client_with(stream, 10);
+
+        let err = client.subscribe_raw("t", QoS::AtMostOnce).unwrap_err();
+
+        match err {
+            Error::AckRejected {
+                packet: "SUBACK",
+                reason_code: 0x80,
+            } => {}
+            other => panic!("expected negative SUBACK, got {other:?}"),
         }
     }
 }

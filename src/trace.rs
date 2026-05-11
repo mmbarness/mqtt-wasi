@@ -65,18 +65,12 @@ impl TraceContext {
     pub fn inject(&self, props: &mut Properties) {
         props.push(
             PropertyId::UserProperty,
-            PropertyValue::StringPair(
-                String::from(TRACEPARENT_KEY),
-                self.traceparent_string(),
-            ),
+            PropertyValue::StringPair(String::from(TRACEPARENT_KEY), self.traceparent_string()),
         );
         if let Some(ref state) = self.tracestate {
             props.push(
                 PropertyId::UserProperty,
-                PropertyValue::StringPair(
-                    String::from(TRACESTATE_KEY),
-                    state.clone(),
-                ),
+                PropertyValue::StringPair(String::from(TRACESTATE_KEY), state.clone()),
             );
         }
     }
@@ -157,8 +151,10 @@ mod tests {
     #[test]
     fn traceparent_round_trip() {
         let ctx = TraceContext::new_root(
-            [0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb6, 0xa2, 0x7b,
-             0xc4, 0xc9, 0x89, 0xd3, 0x5b, 0x8e, 0x7e, 0x00],
+            [
+                0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb6, 0xa2, 0x7b, 0xc4, 0xc9, 0x89, 0xd3, 0x5b, 0x8e,
+                0x7e, 0x00,
+            ],
             [0xe4, 0x57, 0xb5, 0xa2, 0xe4, 0xd8, 0x6b, 0xd1],
         );
         let s = ctx.traceparent_string();

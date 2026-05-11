@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use std::net::TcpStream;
 use std::rc::Rc;
 use std::task::Waker;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::Serialize;
 
+use crate::client::{ping_interval, validate_ack_codes};
 use crate::codec::ping::PINGREQ_BYTES;
 use crate::codec::properties::Properties;
 use crate::codec::types::*;
@@ -29,9 +30,11 @@ pub(crate) struct SharedInner<T: Transport = TcpStream> {
     pub pending: HashMap<String, PendingRequest>,
     pub next_packet_id: u16,
     pub keep_alive_secs: u16,
-    pub last_activity: Instant,
+    pub last_read_at: Instant,
+    pub last_write_at: Instant,
     pub error: Option<Error>,
     pub amqp_reply_format: bool,
+    pub reply_topic_prefix: String,
 }
 
 pub(crate) type Shared<T = TcpStream> = Rc<RefCell<SharedInner<T>>>;
@@ -61,6 +64,8 @@ impl<T: Transport> AsyncMqttClient<T> {
     /// The CONNECT/CONNACK handshake is done synchronously (blocking),
     /// then the socket is switched to non-blocking for cooperative polling.
     pub async fn connect_with(stream: T, options: ConnectOptions) -> Result<Self> {
+        let reply_topic_prefix = format!("egress/reply/{}/", uuid::Uuid::new_v4());
+        let now = Instant::now();
         let client = Self {
             inner: Rc::new(RefCell::new(SharedInner {
                 stream,
@@ -68,17 +73,20 @@ impl<T: Transport> AsyncMqttClient<T> {
                 pending: HashMap::new(),
                 next_packet_id: 1,
                 keep_alive_secs: options.keep_alive_secs,
-                last_activity: Instant::now(),
+                last_read_at: now,
+                last_write_at: now,
                 error: None,
                 amqp_reply_format: options.amqp_reply_format,
+                reply_topic_prefix,
             })),
         };
 
         // Blocking handshake
         {
             let mut inner = client.inner.borrow_mut();
-            let timeout = Duration::from_secs(options.keep_alive_secs as u64 / 2);
-            inner.stream.set_read_timeout(Some(timeout))?;
+            inner
+                .stream
+                .set_read_timeout(ping_interval(options.keep_alive_secs))?;
 
             let connect = ConnectPacket {
                 protocol_version: 5,
@@ -91,10 +99,11 @@ impl<T: Transport> AsyncMqttClient<T> {
             };
             let bytes = connect.encode()?;
             inner.stream.write_all(&bytes)?;
-            inner.last_activity = Instant::now();
+            inner.last_write_at = Instant::now();
 
             // Read CONNACK (blocking)
             let packet = read_packet_blocking(&mut inner.stream)?;
+            inner.last_read_at = Instant::now();
             match packet {
                 Packet::ConnAck(ack) => {
                     if ack.reason_code != 0x00 {
@@ -102,6 +111,27 @@ impl<T: Transport> AsyncMqttClient<T> {
                     }
                 }
                 _ => return Err(Error::UnexpectedPacket("expected CONNACK")),
+            }
+
+            let sub_id = next_packet_id(&mut inner);
+            let sub = SubscribePacket {
+                packet_id: sub_id,
+                filters: vec![(format!("{}+", inner.reply_topic_prefix), QoS::AtMostOnce)],
+                properties: Properties::new(),
+            };
+            inner.stream.write_all(&sub.encode()?)?;
+            inner.last_write_at = Instant::now();
+
+            loop {
+                let packet = read_packet_blocking(&mut inner.stream)?;
+                inner.last_read_at = Instant::now();
+                match packet {
+                    Packet::SubAck(ack) if ack.packet_id == sub_id => {
+                        validate_ack_codes("SUBACK", &ack.reason_codes, 1)?;
+                        break;
+                    }
+                    _ => continue,
+                }
             }
 
             // Switch to non-blocking
@@ -113,11 +143,7 @@ impl<T: Transport> AsyncMqttClient<T> {
     }
 
     /// Send a request and await the correlated reply.
-    pub fn request<Req: Serialize>(
-        &self,
-        topic: &str,
-        payload: &Req,
-    ) -> RequestFuture<T> {
+    pub fn request<Req: Serialize>(&self, topic: &str, payload: &Req) -> RequestFuture<T> {
         RequestFuture::new(self.inner.clone(), topic.to_string(), payload)
     }
 
@@ -128,6 +154,7 @@ impl<T: Transport> AsyncMqttClient<T> {
         let pkt = DisconnectPacket { reason_code: 0x00 };
         let bytes = pkt.encode()?;
         inner.stream.write_all(&bytes)?;
+        inner.last_write_at = Instant::now();
         inner.stream.shutdown()?;
         Ok(())
     }
@@ -144,22 +171,24 @@ pub(crate) fn next_packet_id<T: Transport>(inner: &mut SharedInner<T>) -> u16 {
     id
 }
 
-pub(crate) fn write_blocking<T: Transport>(
-    stream: &mut T,
-    buf: &[u8],
-) -> Result<()> {
+pub(crate) fn write_blocking<T: Transport>(inner: &mut SharedInner<T>, buf: &[u8]) -> Result<()> {
     // Temporarily switch to blocking for writes to avoid WouldBlock on write_all.
-    stream.set_nonblocking(false)?;
-    let result = stream.write_all(buf);
-    stream.set_nonblocking(true)?;
-    result.map_err(Error::from)
+    inner.stream.set_nonblocking(false)?;
+    let result = inner.stream.write_all(buf);
+    let restore = inner.stream.set_nonblocking(true);
+    result?;
+    restore?;
+    inner.last_write_at = Instant::now();
+    Ok(())
 }
 
 pub(crate) fn maybe_ping<T: Transport>(inner: &mut SharedInner<T>) -> Result<()> {
-    let elapsed = inner.last_activity.elapsed();
-    if elapsed >= Duration::from_secs(inner.keep_alive_secs as u64 / 2) {
-        write_blocking(&mut inner.stream, &PINGREQ_BYTES)?;
-        inner.last_activity = Instant::now();
+    let Some(interval) = ping_interval(inner.keep_alive_secs) else {
+        return Ok(());
+    };
+
+    if inner.last_write_at.elapsed() >= interval {
+        write_blocking(inner, &PINGREQ_BYTES)?;
     }
     Ok(())
 }
