@@ -1,84 +1,98 @@
-//! Echo consumers for the request_reply example.
+//! Plain-byte responders for the request/response example.
 //!
-//! Spawns 3 threads, each subscribing to a topic and echoing replies.
-//! Run this natively before running the WASM requester.
-//!
-//! Usage:
-//!   MQTT_ADDR=... cargo run --bin consumer
+//! Each responder reads MQTT v5 Response Topic and Correlation Data properties,
+//! then copies Correlation Data onto its response. There is no RPC envelope.
 
-use mqtt_wasi::{ConnectOptions, MqttClient, QoS};
+use mqtt_wasi::codec::properties::Properties;
+use mqtt_wasi::{ConnectOptions, MqttClient, PublishOptions, QoS};
 use std::thread;
 
 fn main() {
     let addr = std::env::var("MQTT_ADDR").unwrap_or_else(|_| "127.0.0.1:1883".into());
-
     let topics = [
-        ("mqtt-wasi/rpc/double", "double"),
-        ("mqtt-wasi/rpc/greet", "greet"),
-        ("mqtt-wasi/rpc/reverse", "reverse"),
+        ("mqtt-wasi/example/double", Operation::Double),
+        ("mqtt-wasi/example/greet", Operation::Greet),
+        ("mqtt-wasi/example/reverse", Operation::Reverse),
     ];
-
-    println!("starting 3 consumers on {addr}...");
+    let responder_count = topics.len();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
     let handles: Vec<_> = topics
-        .iter()
+        .into_iter()
         .enumerate()
-        .map(|(i, (topic, name))| {
+        .map(|(index, (topic, operation))| {
             let addr = addr.clone();
-            let topic = topic.to_string();
-            let name = name.to_string();
-            thread::spawn(move || {
-                echo_consumer(&addr, &format!("consumer-{i}"), &topic, &name);
-            })
+            let ready_tx = ready_tx.clone();
+            thread::spawn(move || serve_once(&addr, index, topic, operation, ready_tx))
         })
         .collect();
+    drop(ready_tx);
 
-    println!("consumers ready — waiting for requests (ctrl-c to stop)");
-
-    for h in handles {
-        h.join().ok();
+    for _ in 0..responder_count {
+        ready_rx.recv().expect("responder stopped before SUBACK");
+    }
+    println!("responders ready on {addr}");
+    for handle in handles {
+        handle.join().expect("responder thread panicked");
     }
 }
 
-fn echo_consumer(addr: &str, client_id: &str, topic: &str, name: &str) {
-    let mut opts = ConnectOptions::new(client_id).with_keep_alive(30);
-    if let (Ok(u), Ok(p)) = (std::env::var("MQTT_USER"), std::env::var("MQTT_PASS")) {
-        opts = opts.with_credentials(u, p.as_bytes());
+#[derive(Clone, Copy)]
+enum Operation {
+    Double,
+    Greet,
+    Reverse,
+}
+
+fn serve_once(
+    addr: &str,
+    index: usize,
+    topic: &str,
+    operation: Operation,
+    ready: std::sync::mpsc::Sender<()>,
+) {
+    let mut options = ConnectOptions::new(format!("example-responder-{index}"));
+    if let (Ok(user), Ok(pass)) = (std::env::var("MQTT_USER"), std::env::var("MQTT_PASS")) {
+        options = options.with_credentials(user, pass.as_bytes());
     }
 
-    let mut client = MqttClient::connect(addr, opts).expect("consumer connect");
-    client.subscribe_raw(topic, QoS::AtMostOnce).expect("subscribe");
-    println!("  [{name}] subscribed to {topic}");
-
-    // Serve one request then exit
-    let msg = client.recv_raw().expect("recv").expect("no msg");
-    let req: serde_json::Value = serde_json::from_slice(&msg.payload).expect("parse");
-
-    let reply_to = req["replyTo"].as_str().expect("replyTo");
-    let correlation_id = req["correlationId"].as_str().expect("correlationId");
-    let params = &req["params"];
-
-    let data = if name == "double" {
-        let v = params["value"].as_i64().unwrap_or(0);
-        serde_json::json!({"result": v * 2})
-    } else if name == "greet" {
-        let n = params["name"].as_str().unwrap_or("?");
-        serde_json::json!({"message": format!("Hello, {n}!")})
-    } else {
-        let text = params["text"].as_str().unwrap_or("");
-        let reversed: String = text.chars().rev().collect();
-        serde_json::json!({"reversed": reversed})
-    };
-
-    let reply = serde_json::json!({
-        "correlationId": correlation_id,
-        "result": {"ok": true, "data": data}
-    });
-    let bytes = serde_json::to_vec(&reply).expect("serialize");
+    let mut client = MqttClient::connect(addr, options).expect("responder connect");
     client
-        .publish_raw(reply_to, &bytes, QoS::AtMostOnce, false, Default::default())
-        .expect("reply");
+        .subscribe(topic, QoS::AtLeastOnce)
+        .expect("subscribe");
+    ready.send(()).expect("requester process stopped");
 
-    println!("  [{name}] replied");
-    client.disconnect().ok();
+    let request = client.recv().expect("receive").expect("broker closed");
+    let response_topic = request
+        .properties
+        .response_topic()
+        .expect("request omitted Response Topic")
+        .to_owned();
+    let correlation_data = request
+        .properties
+        .correlation_data()
+        .expect("request omitted Correlation Data")
+        .to_vec();
+    let response = transform(operation, &request.payload);
+    let properties = Properties::new().with_correlation_data(correlation_data);
+
+    client
+        .publish(
+            &response_topic,
+            response,
+            PublishOptions::default().with_properties(properties),
+        )
+        .expect("publish response");
+    client.disconnect().expect("disconnect");
+}
+
+fn transform(operation: Operation, payload: &[u8]) -> Vec<u8> {
+    let text = std::str::from_utf8(payload).expect("request payload was not UTF-8");
+    match operation {
+        Operation::Double => (text.parse::<i64>().expect("expected an integer") * 2)
+            .to_string()
+            .into_bytes(),
+        Operation::Greet => format!("Hello, {text}!").into_bytes(),
+        Operation::Reverse => text.chars().rev().collect::<String>().into_bytes(),
+    }
 }

@@ -1,0 +1,184 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  MSRV: 1.94.0
+
+jobs:
+  quality:
+    name: Format, Clippy, and docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.MSRV }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: |
+          cargo fmt --all -- --check
+          for manifest in examples/*/Cargo.toml; do
+            cargo fmt --manifest-path "${manifest}" -- --check
+          done
+      - name: Run Clippy with every feature
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Build public documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --all-features --no-deps
+
+  feature-checks:
+    name: Features (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-std
+            target: wasm32-unknown-unknown
+            feature_args: ""
+          - name: serde
+            target: x86_64-unknown-linux-gnu
+            feature_args: --features serde
+          - name: std-only
+            target: x86_64-unknown-linux-gnu
+            feature_args: --features std
+          - name: async-client
+            target: x86_64-unknown-linux-gnu
+            feature_args: --features async-client
+          - name: request-response
+            target: x86_64-unknown-linux-gnu
+            feature_args: --features request-response
+          - name: tls
+            target: x86_64-unknown-linux-gnu
+            feature_args: --features tls
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.MSRV }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-${{ matrix.name }}
+      - name: Check feature set
+        run: >-
+          cargo check --locked --lib --no-default-features
+          --target ${{ matrix.target }} ${{ matrix.feature_args }}
+
+  native-tests:
+    name: Native tests with Mosquitto
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-tests
+      - name: Start local MQTT broker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes mosquitto netcat-openbsd
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          mosquitto -p 1883 -v >"${RUNNER_TEMP}/mosquitto.log" 2>&1 &
+          for attempt in {1..50}; do
+            if nc -z 127.0.0.1 1883; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          cat "${RUNNER_TEMP}/mosquitto.log"
+          exit 1
+      - name: Run unit and integration tests
+        env:
+          MQTT_TEST_REQUIRED: "1"
+        run: >-
+          env -u MQTT_TLS_ADDR -u MQTT_TLS_USER -u MQTT_TLS_PASS
+          cargo test --locked --all-features --all-targets -- --test-threads=1
+      - name: Print broker log after a failure
+        if: failure()
+        run: cat "${RUNNER_TEMP}/mosquitto.log" || true
+
+  wasi:
+    name: WASIp2 (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            feature_args: ""
+          - name: tls
+            feature_args: --features tls
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.MSRV }}
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasi-${{ matrix.name }}
+      - name: Build library
+        run: >-
+          cargo build --locked --lib --target wasm32-wasip2
+          ${{ matrix.feature_args }}
+
+  examples:
+    name: Examples (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, wasm32-wasip2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.MSRV }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: examples-${{ matrix.target }}
+      - name: Build standalone examples
+        run: |
+          for manifest in examples/*/Cargo.toml; do
+            cargo build --manifest-path "${manifest}" --target ${{ matrix.target }}
+          done
+
+  package:
+    name: Package verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+      - name: Verify publishable crate
+        run: cargo package --locked

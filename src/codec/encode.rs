@@ -1,7 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::codec::types::PacketType;
+use crate::codec::types::{FixedHeader, PacketType};
 use crate::error::{Error, Result};
 
 /// Maximum value for an MQTT variable-length integer.
@@ -10,7 +10,10 @@ const VARIABLE_INT_MAX: u32 = 268_435_455;
 /// Encode a variable-length integer (MQTT spec 1.5.5).
 pub fn encode_variable_int(buf: &mut Vec<u8>, mut value: u32) -> Result<()> {
     if value > VARIABLE_INT_MAX {
-        return Err(Error::PacketTooLarge);
+        return Err(Error::PacketTooLarge {
+            size: value as usize,
+            max: VARIABLE_INT_MAX as usize,
+        });
     }
     loop {
         let mut byte = (value & 0x7F) as u8;
@@ -42,6 +45,9 @@ pub fn encode_string(buf: &mut Vec<u8>, s: &str) -> Result<()> {
     if len > 65_535 {
         return Err(Error::StringTooLong(len));
     }
+    if s.as_bytes().contains(&0) {
+        return Err(Error::MalformedPacket("MQTT string contains null"));
+    }
     buf.extend_from_slice(&(len as u16).to_be_bytes());
     buf.extend_from_slice(s.as_bytes());
     Ok(())
@@ -51,7 +57,7 @@ pub fn encode_string(buf: &mut Vec<u8>, s: &str) -> Result<()> {
 pub fn encode_binary(buf: &mut Vec<u8>, data: &[u8]) -> Result<()> {
     let len = data.len();
     if len > 65_535 {
-        return Err(Error::StringTooLong(len));
+        return Err(Error::BinaryTooLong(len));
     }
     buf.extend_from_slice(&(len as u16).to_be_bytes());
     buf.extend_from_slice(data);
@@ -70,7 +76,17 @@ pub fn encode_fixed_header(
     flags: u8,
     remaining_length: u32,
 ) -> Result<()> {
-    let type_byte = ((packet_type as u8) << 4) | (flags & 0x0F);
+    if flags > 0x0F {
+        return Err(Error::MalformedPacket(
+            "fixed-header flags exceed four bits",
+        ));
+    }
+    crate::codec::decode::validate_fixed_header(FixedHeader {
+        packet_type,
+        flags,
+        remaining_length,
+    })?;
+    let type_byte = ((packet_type as u8) << 4) | flags;
     buf.push(type_byte);
     encode_variable_int(buf, remaining_length)
 }
@@ -132,6 +148,14 @@ mod tests {
     }
 
     #[test]
+    fn string_rejects_null_character() {
+        assert!(matches!(
+            encode_string(&mut Vec::new(), "before\0after"),
+            Err(Error::MalformedPacket("MQTT string contains null"))
+        ));
+    }
+
+    #[test]
     fn empty_string() {
         let mut buf = Vec::new();
         encode_string(&mut buf, "").unwrap();
@@ -150,5 +174,19 @@ mod tests {
         let mut buf = Vec::new();
         encode_fixed_header(&mut buf, PacketType::Connect, 0, 10).unwrap();
         assert_eq!(buf, [0x10, 0x0A]);
+    }
+
+    #[test]
+    fn fixed_header_encoding_rejects_reserved_or_truncated_flags() {
+        assert!(matches!(
+            encode_fixed_header(&mut Vec::new(), PacketType::PingResp, 0x01, 0),
+            Err(Error::MalformedPacket("invalid fixed-header flags"))
+        ));
+        assert!(matches!(
+            encode_fixed_header(&mut Vec::new(), PacketType::Publish, 0x10, 0),
+            Err(Error::MalformedPacket(
+                "fixed-header flags exceed four bits"
+            ))
+        ));
     }
 }
