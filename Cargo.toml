@@ -1,9 +1,9 @@
 [package]
 name = "mqtt-wasi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.94"
-description = "Minimal MQTT v5.0 client that compiles to wasm32-wasip2"
+description = "Runtime-light MQTT v5 client for native Rust and wasm32-wasip2"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mmbarness/mqtt-wasi"
 documentation = "https://docs.rs/mqtt-wasi"
@@ -12,23 +12,31 @@ keywords = ["mqtt", "wasm", "wasip2", "wasmtime", "iot"]
 categories = ["network-programming", "wasm"]
 
 [features]
-default = ["std"]
+default = ["std", "async-client"]
 std = []
+async-client = ["std", "dep:tokio"]
+request-response = ["async-client", "dep:uuid"]
+serde = ["std", "dep:serde", "dep:serde_json"]
 tls = ["std", "dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots", "dep:rustls-rustcrypto"]
 
 [dependencies]
-serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
-uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", optional = true, default-features = false, features = ["alloc"] }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "sync", "time"] }
+uuid = { version = "1", optional = true, default-features = false, features = ["v4"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["logging", "std", "tls12"] }
 rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
 rustls-pki-types = { version = "1", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 dotenvy = "0.15.7"
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "wasm32-wasip2"]
 
 [profile.release]
 lto = true

@@ -2,11 +2,10 @@
 name = "pubsub"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [dependencies]
 mqtt-wasi = { path = "../.." }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 [profile.release]
 lto = true

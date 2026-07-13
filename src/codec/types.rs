@@ -1,5 +1,6 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
+use core::fmt;
 
 use crate::codec::properties::Properties;
 
@@ -73,7 +74,7 @@ pub struct FixedHeader {
     pub remaining_length: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectPacket {
     pub protocol_version: u8,
     pub clean_start: bool,
@@ -82,6 +83,21 @@ pub struct ConnectPacket {
     pub username: Option<String>,
     pub password: Option<Vec<u8>>,
     pub properties: Properties,
+}
+
+impl fmt::Debug for ConnectPacket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectPacket")
+            .field("protocol_version", &self.protocol_version)
+            .field("clean_start", &self.clean_start)
+            .field("keep_alive", &self.keep_alive)
+            .field("client_id", &self.client_id)
+            .field("username_set", &self.username.is_some())
+            .field("password_set", &self.password.is_some())
+            .field("properties", &self.properties)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,4 +169,33 @@ pub enum Packet {
     PingReq,
     PingResp,
     Disconnect(DisconnectPacket),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_packet_debug_redacts_credentials_directly_and_in_packet() {
+        let connect = ConnectPacket {
+            protocol_version: 5,
+            clean_start: true,
+            keep_alive: 30,
+            client_id: String::from("debug-client"),
+            username: Some(String::from("visible-user")),
+            password: Some(b"super-secret".to_vec()),
+            properties: Properties::new(),
+        };
+
+        for debug in [
+            format!("{connect:?}"),
+            format!("{:?}", Packet::Connect(connect)),
+        ] {
+            assert!(debug.contains("username_set: true"));
+            assert!(debug.contains("password_set: true"));
+            assert!(!debug.contains("visible-user"));
+            assert!(!debug.contains("super-secret"));
+            assert!(!debug.contains("[115, 117, 112"));
+        }
+    }
 }

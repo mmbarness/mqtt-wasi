@@ -1,55 +1,55 @@
-//! Publish/subscribe over TLS — compiles to both native and wasm32-wasip2.
+//! Bytes-first publish/subscribe over the experimental TLS transport.
 //!
 //! Native:
-//!   MQTT_ADDR=broker.example.com:8883 MQTT_USER=user MQTT_PASS=pass cargo run
+//!   MQTT_TLS_ADDR=broker.example.com:8883 MQTT_TLS_USER=user \
+//!     MQTT_TLS_PASS=pass cargo run
 //!
-//! WASM:
+//! WASI:
 //!   cargo build --target wasm32-wasip2 --release
-//!   MQTT_ADDR=broker.example.com:8883 MQTT_USER=user MQTT_PASS=pass \
+//!   MQTT_TLS_ADDR=broker.example.com:8883 MQTT_TLS_USER=user MQTT_TLS_PASS=pass \
 //!     wasmtime run -S inherit-network,allow-ip-name-lookup,inherit-env \
 //!     target/wasm32-wasip2/release/tls-pubsub.wasm
 
-use mqtt_wasi::{ConnectOptions, MqttClient, QoS, TlsTransport};
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SensorReading {
-    device_id: String,
-    celsius: f64,
-}
+use mqtt_wasi::{ConnectOptions, MqttClient, PublishOptions, QoS, TlsTransport};
 
 fn main() {
-    let addr = std::env::var("MQTT_ADDR").expect("MQTT_ADDR required (host:8883)");
-    let user = std::env::var("MQTT_USER").expect("MQTT_USER required");
-    let pass = std::env::var("MQTT_PASS").expect("MQTT_PASS required");
+    let addr = std::env::var("MQTT_TLS_ADDR").expect("MQTT_TLS_ADDR required (host:port)");
+    let user = std::env::var("MQTT_TLS_USER").expect("MQTT_TLS_USER required");
+    let pass = std::env::var("MQTT_TLS_PASS").expect("MQTT_TLS_PASS required");
     let topic = "mqtt-wasi/example/tls-sensors";
 
-    let opts = |id: &str| {
-        ConnectOptions::new(id)
+    let options = |client_id: &str| {
+        ConnectOptions::new(client_id)
             .with_keep_alive(30)
             .with_credentials(&user, pass.as_bytes())
     };
 
-    // Subscriber over TLS
-    let tls_sub = TlsTransport::connect(&addr).expect("TLS connect (sub)");
-    let mut sub = MqttClient::connect_with(tls_sub, opts("tls-example-sub")).expect("MQTT connect");
-    sub.subscribe_raw(topic, QoS::AtMostOnce).expect("subscribe");
-    println!("[sub] subscribed to {topic} over TLS");
+    let subscriber_transport = TlsTransport::connect(&addr).expect("subscriber TLS connect");
+    let mut subscriber =
+        MqttClient::connect_with(subscriber_transport, options("tls-example-subscriber"))
+            .expect("subscriber MQTT connect");
+    subscriber
+        .subscribe(topic, QoS::AtLeastOnce)
+        .expect("subscribe");
 
-    // Publisher over TLS (separate connection)
-    let tls_pub = TlsTransport::connect(&addr).expect("TLS connect (pub)");
-    let mut publ = MqttClient::connect_with(tls_pub, opts("tls-example-pub")).expect("MQTT connect");
-    let reading = SensorReading {
-        device_id: "sensor-1".into(),
-        celsius: 22.5,
-    };
-    publ.publish(topic, &reading).expect("publish");
-    println!("[pub] sent: {reading:?}");
-    publ.disconnect().ok();
+    let publisher_transport = TlsTransport::connect(&addr).expect("publisher TLS connect");
+    let mut publisher =
+        MqttClient::connect_with(publisher_transport, options("tls-example-publisher"))
+            .expect("publisher MQTT connect");
+    publisher
+        .publish(
+            topic,
+            br#"{"device_id":"sensor-1","celsius":22.5}"#,
+            PublishOptions::default().with_qos(QoS::AtLeastOnce),
+        )
+        .expect("publish");
+    publisher.disconnect().expect("publisher disconnect");
 
-    // Receive
-    let msg = sub.recv_raw().expect("recv").expect("no message");
-    let payload: SensorReading = serde_json::from_slice(&msg.payload).expect("deserialize");
-    println!("[sub] received: {payload:?}");
-    sub.disconnect().ok();
+    let message = subscriber.recv().expect("receive").expect("broker closed");
+    println!(
+        "{}: {}",
+        message.topic,
+        String::from_utf8_lossy(&message.payload)
+    );
+    subscriber.disconnect().expect("subscriber disconnect");
 }

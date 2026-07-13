@@ -1,5 +1,5 @@
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
 use crate::codec::types::FixedHeader;
 use crate::codec::types::PacketType;
@@ -90,6 +90,9 @@ impl<'a> Cursor<'a> {
     pub fn read_string(&mut self) -> Result<String> {
         let len = self.read_u16()? as usize;
         let bytes = self.read_bytes(len)?;
+        if bytes.contains(&0) {
+            return Err(Error::MalformedPacket("MQTT string contains null"));
+        }
         String::from_utf8(bytes.to_vec()).map_err(|_| Error::MalformedPacket("invalid UTF-8"))
     }
 
@@ -108,14 +111,35 @@ pub fn decode_fixed_header(data: &[u8]) -> Result<(FixedHeader, usize)> {
     let packet_type = PacketType::from_u8(first_byte >> 4)?;
     let flags = first_byte & 0x0F;
     let remaining_length = cur.read_variable_int()?;
-    Ok((
-        FixedHeader {
-            packet_type,
-            flags,
-            remaining_length,
-        },
-        cur.position(),
-    ))
+    let header = FixedHeader {
+        packet_type,
+        flags,
+        remaining_length,
+    };
+    validate_fixed_header(header)?;
+    Ok((header, cur.position()))
+}
+
+/// Validate the reserved fixed-header flags for a decoded packet type.
+pub(crate) fn validate_fixed_header(header: FixedHeader) -> Result<()> {
+    let expected = match header.packet_type {
+        PacketType::Publish => {
+            let qos = (header.flags >> 1) & 0x03;
+            if qos == 0x03 {
+                return Err(Error::InvalidQoS(qos));
+            }
+            if qos == 0 && header.flags & 0x08 != 0 {
+                return Err(Error::MalformedPacket("QoS 0 PUBLISH has DUP flag"));
+            }
+            return Ok(());
+        }
+        PacketType::PubRel | PacketType::Subscribe | PacketType::Unsubscribe => 0x02,
+        _ => 0x00,
+    };
+    if header.flags != expected {
+        return Err(Error::MalformedPacket("invalid fixed-header flags"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -158,12 +182,37 @@ mod tests {
     }
 
     #[test]
+    fn cursor_rejects_null_in_string() {
+        let mut cursor = Cursor::new(&[0, 3, b'a', 0, b'b']);
+        assert!(matches!(
+            cursor.read_string(),
+            Err(Error::MalformedPacket("MQTT string contains null"))
+        ));
+    }
+
+    #[test]
     fn decode_connect_fixed_header() {
         let (header, consumed) = decode_fixed_header(&[0x10, 0x0A]).unwrap();
         assert_eq!(header.packet_type, PacketType::Connect);
         assert_eq!(header.flags, 0);
         assert_eq!(header.remaining_length, 10);
         assert_eq!(consumed, 2);
+    }
+
+    #[test]
+    fn rejects_reserved_fixed_header_flags() {
+        assert!(matches!(
+            decode_fixed_header(&[0xD1, 0x00]),
+            Err(Error::MalformedPacket("invalid fixed-header flags"))
+        ));
+        assert!(matches!(
+            decode_fixed_header(&[0x3E, 0x00]),
+            Err(Error::InvalidQoS(3))
+        ));
+        assert!(matches!(
+            decode_fixed_header(&[0x38, 0x00]),
+            Err(Error::MalformedPacket("QoS 0 PUBLISH has DUP flag"))
+        ));
     }
 
     #[test]

@@ -1,15 +1,16 @@
-//! Minimal MQTT v5.0 client that compiles to `wasm32-wasip2`.
+//! Runtime-light MQTT v5 client for native Rust and `wasm32-wasip2`.
 //!
-//! Two client modes:
-//! - [`MqttClient`] — synchronous, blocking pub/sub
-//! - [`AsyncMqttClient`] — cooperative non-blocking request/reply for concurrent
-//!   calls via `tokio::join!`
+//! The blocking [`MqttClient`] and the optional async [`AsyncMqttClient`] use
+//! raw byte payloads and standard MQTT properties. Async connections are driven
+//! independently by [`MqttConnection`], so network I/O and keepalive continue
+//! without an active publish or request future.
 //!
-//! Optional TLS via the `tls` feature (pure Rust crypto, Wasm-compatible).
+//! Optional TLS is available through the experimental `tls` feature.
 //!
 //! See the [README](https://github.com/mmbarness/mqtt-wasi) for full usage examples.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -18,7 +19,7 @@ pub mod codec;
 pub mod error;
 pub mod trace;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "async-client")]
 pub mod async_client;
 #[cfg(feature = "std")]
 pub mod client;
@@ -26,26 +27,28 @@ pub mod client;
 pub mod frame;
 #[cfg(feature = "std")]
 pub mod options;
-#[cfg(feature = "std")]
-pub mod request;
+#[cfg(feature = "request-response")]
+pub mod request_response;
 #[cfg(feature = "tls")]
 pub mod tls;
 #[cfg(feature = "std")]
 pub mod transport;
 
 // Re-exports for convenience
-pub use crate::codec::types::{Packet, QoS};
+pub use crate::codec::types::{Packet, PublishPacket, QoS};
 pub use crate::error::Error;
 pub use crate::trace::TraceContext;
 
+#[cfg(feature = "async-client")]
+pub use crate::async_client::{
+    AsyncMqttClient, DisconnectReason, Event, MqttConnection, PublishAck, SubscriptionAck,
+};
 #[cfg(feature = "std")]
-pub use crate::async_client::AsyncMqttClient;
+pub use crate::client::{Incoming, MqttClient};
 #[cfg(feature = "std")]
-pub use crate::client::{Message, MqttClient, RawMessage, Subscription};
-#[cfg(feature = "std")]
-pub use crate::options::ConnectOptions;
-#[cfg(feature = "std")]
-pub use crate::request::{ReplyEnvelope, RequestEnvelope};
+pub use crate::options::{ConnectOptions, PublishOptions};
+#[cfg(feature = "request-response")]
+pub use crate::request_response::RequestOptions;
 #[cfg(feature = "tls")]
 pub use crate::tls::TlsTransport;
 #[cfg(feature = "std")]

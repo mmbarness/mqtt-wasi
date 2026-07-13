@@ -1,54 +1,106 @@
-# CLAUDE.md
+# Repository guidance
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+`mqtt-wasi` is a public, bytes-first MQTT v5 client for native Rust and
+`wasm32-wasip2`. Treat the `0.2` API as general-purpose infrastructure: do not
+add application envelopes, fixed topic prefixes, broker bridge rewrites, or a
+required serialization format.
 
-## Build & Test
+## Build and test
+
+The minimum supported Rust version is 1.94.
 
 ```bash
-cargo build                                    # native build
-cargo build --features tls                     # with TLS support
-cargo build --target wasm32-wasip2 --release   # wasm build
-cargo test                                     # unit + integration tests (needs Mosquitto on localhost:1883)
-cargo test --features tls                      # includes TLS tests (needs HIVEMQ_* env vars)
-cargo test --test async_integration            # async request/reply tests only
-cargo test --test egress_cloudamqp             # CloudAMQP live tests (needs CLOUDAMQP_URL)
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features --all-targets
+cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
+cargo build --locked --lib --target wasm32-wasip2
+cargo build --locked --lib --target wasm32-wasip2 --features tls
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
+cargo package --locked
 ```
 
-Local Mosquitto for basic tests:
+The standalone examples are separate packages, not a Cargo workspace:
+
 ```bash
-docker run -d --name mosquitto -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
+for manifest in examples/*/Cargo.toml; do
+  cargo build --manifest-path "$manifest"
+  cargo build --manifest-path "$manifest" --target wasm32-wasip2
+done
 ```
 
-External broker tests read from `.env` (gitignored) or environment variables. Tests skip gracefully when env vars are missing.
+Local integration tests expect Mosquitto at `127.0.0.1:1883`. They skip when it
+is absent unless `MQTT_TEST_REQUIRED=1`; CI always sets that flag so a broken
+handshake cannot masquerade as a skip. Optional external TLS tests use only
+`MQTT_TLS_ADDR`, `MQTT_TLS_USER`, and `MQTT_TLS_PASS` and are not part of CI.
 
 ## Architecture
 
-Three layers:
+- `codec/` is the `no_std` plus `alloc` protocol core. It owns packet types,
+  properties, and deterministic encoding/decoding.
+- `frame.rs` incrementally assembles bounded MQTT frames and preserves partial
+  reads.
+- `transport.rs` defines ordered read/write behavior. TCP is the default; TLS
+  is optional.
+- `client.rs` is the blocking `MqttClient<T: Transport>`. ACK waits dispatch
+  unrelated inbound PUBLISH packets into a bounded FIFO.
+- `async_client.rs` contains the cloneable `AsyncMqttClient` handle and the
+  sole-owner `MqttConnection<T>` driver.
+- `request_response.rs` is an optional standard MQTT v5 helper based on
+  Response Topic and Correlation Data.
+- `trace.rs` maps W3C Trace Context version 00 to MQTT User Properties.
 
-- **`codec/`** — `no_std` (alloc only). Pure MQTT v5.0 wire protocol encode/decode. No I/O. Operates on `Vec<u8>` (encode) and `&[u8]` via a lightweight `Cursor` (decode). Unknown property IDs are skipped, not errored.
-- **Sync client** (`client.rs`) — `MqttClient<T: Transport>`, blocking I/O, typed serde pub/sub.
-- **Async client** (`async_client.rs` + `request.rs` + `frame.rs`) — `AsyncMqttClient<T: Transport>`, cooperative non-blocking I/O for concurrent request/reply via `tokio::join!`.
+`PublishPacket` is the single received-message type across blocking `recv`, the
+blocking iterator, async `Event::Publish`, and request/response results. Raw
+bytes are the primary payload API. The optional `serde` feature implies `std`
+and adds only convenience publishing.
 
-### Async client design
+## Async invariants
 
-The async client uses cooperative polling over one non-blocking TCP socket. There is no I/O reactor on wasip2, so each `RequestFuture` pumps the shared socket when polled and uses a short idle backoff before self-waking. Packets are dispatched by correlation ID to the correct pending request.
+`AsyncMqttClient::connect` and `connect_with` are intentionally synchronous:
+DNS, TCP/TLS, and MQTT handshake work completes before they return
+`(AsyncMqttClient, MqttConnection<T>)`. All subsequent client operations are
+async, and `MqttConnection::run` must be supervised continuously.
 
-Shared state is `Rc<RefCell<SharedInner>>` — single-threaded only. Futures are `!Send`, so `tokio::join!` works but `tokio::spawn` does not (use `spawn_local`).
+Only the driver touches the transport, advances keepalive, assigns packet IDs,
+matches ACKs, and dispatches events. Never add socket I/O or blocking sleeps to
+an operation future. Queues and queued bytes stay bounded. A full event queue
+terminates the driver with `Error::QueueFull("event")`; silently dropping an
+inbound PUBLISH is not acceptable.
 
-The CONNECT/CONNACK handshake and the client-scoped reply-prefix subscription are done in blocking mode. After that, the socket switches to non-blocking. Writes temporarily flip back to blocking to avoid `WouldBlock` on `write_all`.
+Request/response callers should use one stable, ACL-scoped response topic per
+client. The driver caches those subscriptions and limits distinct topics by the
+pending-operation bound. Version 0.2 intentionally has no automatic eviction
+or unsubscribe, so per-request response topics eventually backpressure.
 
-### Transport trait
+## Reliability and security constraints
 
-`transport.rs` defines `Transport` trait. `MqttClient` and `AsyncMqttClient` are generic over `T: Transport`, defaulting to `std::net::TcpStream`. `connect()` uses the default; `connect_with()` accepts a caller-provided transport (e.g. `TlsTransport`).
+- The crate root forbids unsafe code.
+- Check peer-declared packet length before allocating the complete frame.
+- Preserve partial frames across timeout and WouldBlock boundaries.
+- Enforce connect, ACK, request, packet, queue-count, and queued-byte limits.
+- Do not reuse an in-flight packet identifier or leak a waiter after
+  cancellation.
+- Do not log credentials or payloads by default.
+- Correlation Data is not an authorization credential; broker ACLs still apply.
+- Trace and span identifiers must be non-zero. `TraceContext::new_root` and
+  `child` therefore return `Option`.
 
-### TLS
+## Feature contract and scope
 
-`tls.rs` (feature-gated behind `tls`) provides `TlsTransport` wrapping `rustls::StreamOwned<ClientConnection, TcpStream>`. Uses `rustls-rustcrypto` (pure Rust, no C/asm) as the crypto provider — this is the only rustls provider that compiles to `wasm32-wasip2`. The glue crate is alpha (`0.0.2-alpha`) but the underlying RustCrypto primitives are mature. Mozilla root certificates via `webpki-roots`. Works with both sync and async clients via `connect_with()`. `connect_with_config()` accepts a custom `Arc<ClientConfig>` for advanced use.
+Default features are `std` and `async-client`. `request-response`, `serde`, and
+`tls` are opt-in. `--no-default-features` is the genuine `no_std` codec/types
+contract; do not imply that clients or Serde work without `std`.
 
-### AMQP reply format
+The implemented protocol subset is QoS 0/1. QoS 2, reconnect/resubscribe,
+persistent sessions, offline queues, topic aliases, will messages, AUTH, and a
+broker are out of scope for `0.2`.
 
-`ConnectOptions::amqp_reply_format` controls whether `replyTo` in request envelopes uses dots (AMQP routing keys) or slashes (MQTT topics). Enable for RabbitMQ MQTT plugin where the reply publisher is an AMQP consumer.
+TLS is experimental. It uses Mozilla roots and the alpha
+`rustls-rustcrypto` provider, whose graph currently contains a second
+`rustls-webpki` 0.102.x line. Keep timeout/address parsing tests and WASIp2 TLS
+compilation in CI. `TlsTransport::connect` uses a shared ten-second TCP budget;
+the platform's synchronous DNS resolver cannot itself be interrupted.
 
-### Key constraint
-
-Target runtime is **wasmtime** only. WasmEdge does not implement `wasi:sockets/tcp` for wasip2 yet. Non-blocking I/O (`set_nonblocking`) is verified working on wasmtime.
+See [DESIGN.md](DESIGN.md) for the complete v0.2 design contract and
+[CHANGELOG.md](CHANGELOG.md) for release history.

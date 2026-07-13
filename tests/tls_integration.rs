@@ -1,145 +1,96 @@
 #[cfg(feature = "tls")]
 mod tls_tests {
-    use mqtt_wasi::{AsyncMqttClient, ConnectOptions, MqttClient, TlsTransport};
-    use serde_json::json;
+    #[cfg(feature = "async-client")]
+    use mqtt_wasi::AsyncMqttClient;
+    use mqtt_wasi::{ConnectOptions, MqttClient, PublishOptions, QoS, TlsTransport};
+    use std::time::Duration;
 
-    fn hivemq_config() -> Option<(String, String, String)> {
+    struct TlsBroker {
+        addr: String,
+        user: String,
+        pass: String,
+    }
+
+    fn broker() -> Option<TlsBroker> {
         dotenvy::dotenv().ok();
-        let addr = std::env::var("HIVEMQ_ADDR").ok()?;
-        let user = std::env::var("HIVEMQ_USER").ok()?;
-        let pass = std::env::var("HIVEMQ_PASS").ok()?;
-        Some((addr, user, pass))
+        Some(TlsBroker {
+            addr: std::env::var("MQTT_TLS_ADDR").ok()?,
+            user: std::env::var("MQTT_TLS_USER").ok()?,
+            pass: std::env::var("MQTT_TLS_PASS").ok()?,
+        })
     }
 
     fn skip() {
-        eprintln!("HIVEMQ_ADDR/HIVEMQ_USER/HIVEMQ_PASS not set — skipping");
+        eprintln!("MQTT_TLS_ADDR/MQTT_TLS_USER/MQTT_TLS_PASS not set; skipping");
+    }
+
+    fn unique(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
+    }
+
+    fn options(config: &TlsBroker, prefix: &str) -> ConnectOptions {
+        ConnectOptions::new(unique(prefix))
+            .with_credentials(&config.user, config.pass.as_bytes())
+            .with_keep_alive(10)
+            .with_connect_timeout(Duration::from_secs(10))
+            .with_ack_timeout(Duration::from_secs(5))
     }
 
     #[test]
     fn tls_connect_and_disconnect() {
-        let (addr, user, pass) = match hivemq_config() {
-            Some(c) => c,
-            None => return skip(),
+        let Some(config) = broker() else {
+            return skip();
         };
-        let tls = TlsTransport::connect(&addr).unwrap();
-        let client = MqttClient::connect_with(
-            tls,
-            ConnectOptions::new("mqtt-wasi-tls-test")
-                .with_credentials(&user, pass.as_bytes().to_vec()),
-        )
-        .unwrap();
+        let tls =
+            TlsTransport::connect_with_timeout(&config.addr, Duration::from_secs(10)).unwrap();
+        let client = MqttClient::connect_with(tls, options(&config, "tls-connect")).unwrap();
         client.disconnect().unwrap();
     }
 
     #[test]
-    fn tls_publish_and_subscribe() {
-        let (addr, user, pass) = match hivemq_config() {
-            Some(c) => c,
-            None => return skip(),
+    fn tls_publish_and_subscribe_raw_bytes() {
+        let Some(config) = broker() else {
+            return skip();
         };
+        let topic = format!("mqtt-wasi/test/tls/{}", unique("topic"));
 
-        let tls_sub = TlsTransport::connect(&addr).unwrap();
-        let mut sub = MqttClient::connect_with(
-            tls_sub,
-            ConnectOptions::new("mqtt-wasi-tls-sub")
-                .with_credentials(&user, pass.as_bytes().to_vec())
-                .with_keep_alive(10),
-        )
-        .unwrap();
-        sub.subscribe_raw("mqtt-wasi/tls-test", mqtt_wasi::QoS::AtMostOnce)
+        let subscriber_transport = TlsTransport::connect(&config.addr).unwrap();
+        let mut subscriber =
+            MqttClient::connect_with(subscriber_transport, options(&config, "tls-subscriber"))
+                .unwrap();
+        subscriber.subscribe(&topic, QoS::AtMostOnce).unwrap();
+
+        let publisher_transport = TlsTransport::connect(&config.addr).unwrap();
+        let mut publisher =
+            MqttClient::connect_with(publisher_transport, options(&config, "tls-publisher"))
+                .unwrap();
+        publisher
+            .publish(&topic, b"tls bytes", PublishOptions::default())
             .unwrap();
+        publisher.disconnect().unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let tls_pub = TlsTransport::connect(&addr).unwrap();
-        let mut publ = MqttClient::connect_with(
-            tls_pub,
-            ConnectOptions::new("mqtt-wasi-tls-pub")
-                .with_credentials(&user, pass.as_bytes().to_vec()),
-        )
-        .unwrap();
-        publ.publish("mqtt-wasi/tls-test", &json!({"tls": true}))
-            .unwrap();
-        publ.disconnect().unwrap();
-
-        let msg = sub.recv_raw().unwrap().unwrap();
-        assert_eq!(msg.topic, "mqtt-wasi/tls-test");
-        let payload: serde_json::Value = serde_json::from_slice(&msg.payload).unwrap();
-        assert_eq!(payload["tls"], true);
-
-        sub.disconnect().unwrap();
+        let message = subscriber.recv().unwrap().expect("expected a PUBLISH");
+        assert_eq!(message.topic, topic);
+        assert_eq!(message.payload, b"tls bytes");
+        subscriber.disconnect().unwrap();
     }
 
+    #[cfg(feature = "async-client")]
     #[tokio::test(flavor = "current_thread")]
-    async fn tls_async_request_reply() {
-        let (addr, user, pass) = match hivemq_config() {
-            Some(c) => c,
-            None => return skip(),
+    async fn tls_async_client_uses_explicit_driver() {
+        let Some(config) = broker() else {
+            return skip();
         };
+        let transport = TlsTransport::connect(&config.addr).unwrap();
+        let (client, connection) =
+            AsyncMqttClient::connect_with(transport, options(&config, "tls-async")).unwrap();
+        let driver = tokio::spawn(connection.run());
 
-        // Mock responder over TLS (sync, background thread)
-        let addr2 = addr.clone();
-        let user2 = user.clone();
-        let pass2 = pass.clone();
-        let responder = std::thread::spawn(move || {
-            let tls = TlsTransport::connect(&addr2).unwrap();
-            let mut client = MqttClient::connect_with(
-                tls,
-                ConnectOptions::new("mqtt-wasi-tls-responder")
-                    .with_credentials(&user2, pass2.as_bytes().to_vec())
-                    .with_keep_alive(10),
-            )
-            .unwrap();
-
-            client
-                .subscribe_raw("mqtt-wasi/tls-async-test", mqtt_wasi::QoS::AtMostOnce)
-                .unwrap();
-
-            let msg = client.recv_raw().unwrap().unwrap();
-            let envelope: serde_json::Value = serde_json::from_slice(&msg.payload).unwrap();
-            let reply_to = envelope["replyTo"].as_str().unwrap().to_string();
-            let correlation_id = envelope["correlationId"].as_str().unwrap().to_string();
-
-            let reply = json!({
-                "correlationId": correlation_id,
-                "result": { "ok": true, "data": { "tls_async": true } }
-            });
-            let reply_bytes = serde_json::to_vec(&reply).unwrap();
-            client
-                .publish_raw(
-                    &reply_to,
-                    &reply_bytes,
-                    mqtt_wasi::QoS::AtMostOnce,
-                    false,
-                    Default::default(),
-                )
-                .unwrap();
-
-            client.disconnect().unwrap();
-        });
-
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
-        // Async client over TLS
-        let tls = TlsTransport::connect(&addr).unwrap();
-        let client = AsyncMqttClient::connect_with(
-            tls,
-            ConnectOptions::new("mqtt-wasi-tls-async-req")
-                .with_credentials(&user, pass.as_bytes().to_vec())
-                .with_keep_alive(10),
-        )
-        .await
-        .unwrap();
-
-        let result = client
-            .request("mqtt-wasi/tls-async-test", &json!({"prompt": "hello tls"}))
+        client.disconnect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), driver)
             .await
-            .unwrap();
-
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["data"]["tls_async"], true);
-
-        client.disconnect().unwrap();
-        responder.join().unwrap();
+            .expect("TLS driver did not stop")
+            .expect("TLS driver task panicked")
+            .expect("TLS driver failed");
     }
 }
